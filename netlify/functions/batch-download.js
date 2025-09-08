@@ -4,6 +4,7 @@ import { parse as csvParse } from "csv-parse";
 import { stringify as csvStringify } from "csv-stringify";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 export const config = { path: "/api/batch-download" };
 
 export default async (event) => {
@@ -37,14 +38,24 @@ export default async (event) => {
     });
 
     // Download batch output JSONL
-    const out = await client.files.content(b.output_file_id);
-    const outputBuf = Buffer.from(await out.arrayBuffer());
+    const fileResp = await client.files.content(b.output_file_id);
+    const outputBuf = Buffer.from(await fileResp.arrayBuffer());
     const lines = outputBuf.toString("utf8").trim().split("\n");
 
-    // Prepare result rows (copy original + new columns)
+    // Prepare merged rows (copy original + result column)
     const merged = rows.map(r => ({ ...r, result: "" }));
 
-    // For each line (each chunk response), parse and write results
+    // Helper to assign array results
+    const assignByArray = (arr, baseIndex = 0) => {
+      arr.forEach((item, j) => {
+        const idx = Number.isFinite(Number(item?.id)) ? Number(item.id) : (baseIndex + j);
+        if (idx >= 0 && idx < merged.length) {
+          merged[idx].result = typeof item?.result === "string" ? item.result : (item?.toString?.() ?? "");
+        }
+      });
+    };
+
+    // Process each JSONL line (each corresponds to a micro-batch request)
     for (const line of lines) {
       if (!line.trim()) continue;
 
@@ -52,18 +63,17 @@ export default async (event) => {
       try { obj = JSON.parse(line); } catch { continue; }
 
       const base = Number(obj?.custom_id) || 0;
-      const text = obj?.response?.body?.output_text ?? "";
-      let parsed;
-      try { parsed = JSON.parse(text); } catch { parsed = null; }
 
-      const assignByArray = (arr, baseIndex = 0) => {
-        arr.forEach((item, j) => {
-          const idx = Number.isFinite(Number(item?.id)) ? Number(item.id) : (baseIndex + j);
-          if (idx >= 0 && idx < merged.length) {
-            merged[idx].result = typeof item?.result === "string" ? item.result : (item?.toString?.() ?? "");
-          }
-        });
-      };
+      // Try to obtain a string JSON payload from the response body
+      const body = obj?.response?.body || {};
+      const text =
+        typeof body?.output_text === "string" ? body.output_text :
+        (typeof body?.content === "string" ? body.content : "");
+
+      let parsed = null;
+      if (text) {
+        try { parsed = JSON.parse(text); } catch { parsed = null; }
+      }
 
       if (parsed && Array.isArray(parsed.results)) {
         assignByArray(parsed.results, base);
@@ -72,12 +82,12 @@ export default async (event) => {
       } else if (parsed && typeof parsed.result === "string") {
         if (base >= 0 && base < merged.length) merged[base].result = parsed.result;
       } else if (typeof text === "string" && text) {
-        // Fallback: put raw text into the first row of this chunk
+        // Fallback: drop raw text into the first row of this chunk
         if (base >= 0 && base < merged.length) merged[base].result = text;
       }
     }
 
-    // Write merged CSV to response
+    // Serialize merged CSV
     const headers = Object.keys(merged[0] || {});
     const csvStr = await new Promise((resolve, reject) => {
       csvStringify(merged, { header: true, columns: headers }, (err, outStr) => {
@@ -94,6 +104,7 @@ export default async (event) => {
       }
     });
   } catch (e) {
+    console.error("batch-download error:", e);
     return new Response(JSON.stringify({ error: e.message }), { status: 500 });
   }
 };
