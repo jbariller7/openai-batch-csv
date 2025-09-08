@@ -6,3 +6,9 @@
 [functions]
   node_bundler = "esbuild"
   external_node_modules = ["openai", "csv-parse", "csv-stringify", "@netlify/blobs", "busboy"]
+
+# IMPORTANT: Proxy rewrites /api/* directly to functions (preserves POST)
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
