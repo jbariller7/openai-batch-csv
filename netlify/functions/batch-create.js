@@ -9,6 +9,8 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // Optional pretty path when invoking as /.netlify/functions/*
 export const config = { /* path: "/api/batch-create" */ };
+// Some models (gpt-5 family) don't support temperature
+const supportsTemperature = (name) => !/^gpt-5(\b|[-_])/.test(name);
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
