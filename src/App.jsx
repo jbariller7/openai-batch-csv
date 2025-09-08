@@ -64,13 +64,17 @@ export default function App() {
           <textarea rows={6} value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="Describe what to do with each row..." />
         </label>
 
-        <label>Model
-          <select value={model} onChange={(e) => setModel(e.target.value)}>
-            <option>gpt-4.1-mini</option>
-            <option>gpt-4o-mini</option>
-            <option>gpt-4.1</option>
-          </select>
-        </label>
+<label>Model
+  <select value={model} onChange={(e) => setModel(e.target.value)}>
+    <option>gpt-5</option>
+    <option>gpt-5-mini</option>
+    <option>gpt-5-nano</option>
+    <option>gpt-4.1-mini</option>
+    <option>gpt-4o-mini</option>
+    <option>gpt-4.1</option>
+  </select>
+</label>
+
 
         <label>Rows per request (K)
           <input
