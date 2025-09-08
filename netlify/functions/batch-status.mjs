@@ -54,7 +54,4 @@ export default async (reqOrEvent) => {
     console.error("batch-status error:", e);
     return new Response(JSON.stringify({ error: e.message }), {
       status: 500,
-      headers: CORS,
-    });
-  }
-};
+      headers: COR
