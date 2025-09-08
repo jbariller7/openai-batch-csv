@@ -10,6 +10,12 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 export const config = { path: "/api/batch-create" };
 
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type"
+};
+
 // Parse multipart (CSV + fields)
 function parseMultipart(event) {
   return new Promise((resolve, reject) => {
@@ -22,7 +28,7 @@ function parseMultipart(event) {
     let fileInfo = null;
 
     bb.on("file", (_name, file, info) => {
-      fileInfo = info; // { filename, mimeType, encoding }
+      fileInfo = info;
       file.on("data", (d) => fileBuffers.push(d));
     });
 
@@ -39,8 +45,11 @@ function parseMultipart(event) {
 }
 
 export default async (event) => {
+  if (event.httpMethod === "OPTIONS") {
+    return new Response("", { status: 204, headers: CORS });
+  }
   if (event.httpMethod !== "POST") {
-    return new Response(JSON.stringify({ error: "POST only" }), { status: 405 });
+    return new Response(JSON.stringify({ error: "POST only" }), { status: 405, headers: CORS });
   }
 
   try {
@@ -54,7 +63,7 @@ export default async (event) => {
     const reasoningEffort = (fields.reasoning_effort || "").trim(); // minimal|low|medium|high
     const verbosity = (fields.verbosity || "").trim(); // "", low|medium|high (GPT-5)
 
-    if (!fileBuffer) return new Response(JSON.stringify({ error: "CSV file is required" }), { status: 400 });
+    if (!fileBuffer) return new Response(JSON.stringify({ error: "CSV file is required" }), { status: 400, headers: CORS });
 
     // Persist original CSV by jobId
     const jobId = crypto.randomUUID();
@@ -69,7 +78,7 @@ export default async (event) => {
         .on("end", () => resolve(out))
         .on("error", reject);
     });
-    if (!rows.length) return new Response(JSON.stringify({ error: "CSV has no rows" }), { status: 400 });
+    if (!rows.length) return new Response(JSON.stringify({ error: "CSV has no rows" }), { status: 400, headers: CORS });
 
     // Build JSONL with micro-batches of size K
     const isGpt5 = model.startsWith("gpt-5");
@@ -109,7 +118,7 @@ export default async (event) => {
 
     const jsonlBuffer = Buffer.from(lines.join("\n"), "utf8");
 
-    // Upload JSONL to OpenAI via tmp file (robust on Node runtimes)
+    // Upload JSONL to OpenAI via tmp file
     const tmpPath = path.join("/tmp", `${jobId}.jsonl`);
     await fs.writeFile(tmpPath, jsonlBuffer);
     const jsonlFile = await client.files.create({
@@ -136,9 +145,9 @@ export default async (event) => {
       createdAt: new Date().toISOString()
     });
 
-    return new Response(JSON.stringify({ batchId: batch.id, jobId }), { status: 200 });
+    return new Response(JSON.stringify({ batchId: batch.id, jobId }), { status: 200, headers: CORS });
   } catch (err) {
     console.error("batch-create error:", err);
-    return new Response(JSON.stringify({ error: err.message }), { status: 500 });
+    return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: CORS });
   }
 };
