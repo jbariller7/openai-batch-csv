@@ -10,39 +10,70 @@ export const config = { /* path: "/api/batch-download" */ };
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,OPTIONS,HEAD",
-  "Access-Control-Allow-Headers": "Content-Type"
+  "Access-Control-Allow-Headers": "Content-Type",
 };
 
-export default async (event) => {
-  if (event.httpMethod === "OPTIONS" || event.httpMethod === "HEAD") {
+function getMethod(req) {
+  if (req && typeof req.method === "string") return req.method;
+  if (req && typeof req.httpMethod === "string") return req.httpMethod;
+  return "GET";
+}
+function getUrl(req) {
+  return typeof req.url === "string" ? req.url : (req.rawUrl || "");
+}
+
+export default async (reqOrEvent) => {
+  const method = getMethod(reqOrEvent);
+  if (method === "OPTIONS" || method === "HEAD") {
     return new Response("", { status: 204, headers: CORS });
   }
 
-  const url = new URL(event.rawUrl);
+  const url = new URL(getUrl(reqOrEvent));
   const id = url.searchParams.get("id");
-  if (!id) return new Response(JSON.stringify({ error: "Missing id" }), { status: 400, headers: CORS });
+  if (!id) {
+    return new Response(JSON.stringify({ error: "Missing id" }), {
+      status: 400,
+      headers: CORS,
+    });
+  }
 
   try {
     const b = await client.batches.retrieve(id);
     if (b.status !== "completed") {
-      return new Response(JSON.stringify({ error: `Batch not completed. Status: ${b.status}` }), { status: 400, headers: CORS });
+      return new Response(
+        JSON.stringify({ error: `Batch not completed. Status: ${b.status}` }),
+        { status: 400, headers: CORS }
+      );
     }
     if (!b.output_file_id) {
-      return new Response(JSON.stringify({ error: "No output file id" }), { status: 400, headers: CORS });
+      return new Response(JSON.stringify({ error: "No output file id" }), {
+        status: 400,
+        headers: CORS,
+      });
     }
 
     const store = getStore("openai-batch-csv");
     const meta = await store.getJSON(`jobs/${id}.json`);
-    if (!meta) return new Response(JSON.stringify({ error: "Job metadata not found" }), { status: 404, headers: CORS });
+    if (!meta) {
+      return new Response(JSON.stringify({ error: "Job metadata not found" }), {
+        status: 404,
+        headers: CORS,
+      });
+    }
 
     // Read original CSV rows
     const csvBuf = await store.get(`csv/${meta.jobId}.csv`, { type: "buffer" });
-    if (!csvBuf) return new Response(JSON.stringify({ error: "Original CSV not found" }), { status: 404, headers: CORS });
+    if (!csvBuf) {
+      return new Response(JSON.stringify({ error: "Original CSV not found" }), {
+        status: 404,
+        headers: CORS,
+      });
+    }
 
     const rows = await new Promise((resolve, reject) => {
       const out = [];
       csvParse(csvBuf, { columns: true, relax_quotes: true })
-        .on("data", r => out.push(r))
+        .on("data", (r) => out.push(r))
         .on("end", () => resolve(out))
         .on("error", reject);
     });
@@ -50,35 +81,40 @@ export default async (event) => {
     // Download batch output JSONL
     const fileResp = await client.files.content(b.output_file_id);
     const outputBuf = Buffer.from(await fileResp.arrayBuffer());
-    const lines = outputBuf.toString("utf8").trim().split("\n");
+    const jsonlLines = outputBuf.toString("utf8").trim().split("\n");
 
     // Prepare merged rows (copy original + result column)
-    const merged = rows.map(r => ({ ...r, result: "" }));
+    const merged = rows.map((r) => ({ ...r, result: "" }));
 
-    // Helper to assign array results
     const assignByArray = (arr, baseIndex = 0) => {
       arr.forEach((item, j) => {
-        const idx = Number.isFinite(Number(item?.id)) ? Number(item.id) : (baseIndex + j);
+        const idx = Number.isFinite(Number(item?.id))
+          ? Number(item.id)
+          : baseIndex + j;
         if (idx >= 0 && idx < merged.length) {
-          merged[idx].result = typeof item?.result === "string" ? item.result : (item?.toString?.() ?? "");
+          merged[idx].result =
+            typeof item?.result === "string"
+              ? item.result
+              : item?.toString?.() ?? "";
         }
       });
     };
 
-    // Process each JSONL line (each corresponds to a micro-batch request)
-    for (const line of lines) {
+    // Each JSONL line = one micro-batch response
+    for (const line of jsonlLines) {
       if (!line.trim()) continue;
 
       let obj;
       try { obj = JSON.parse(line); } catch { continue; }
 
       const base = Number(obj?.custom_id) || 0;
-
-      // Try to obtain a string JSON payload from the response body
       const body = obj?.response?.body || {};
       const text =
-        typeof body?.output_text === "string" ? body.output_text :
-        (typeof body?.content === "string" ? body.content : "");
+        typeof body?.output_text === "string"
+          ? body.output_text
+          : typeof body?.content === "string"
+          ? body.content
+          : "";
 
       let parsed = null;
       if (text) {
@@ -92,7 +128,6 @@ export default async (event) => {
       } else if (parsed && typeof parsed.result === "string") {
         if (base >= 0 && base < merged.length) merged[base].result = parsed.result;
       } else if (typeof text === "string" && text) {
-        // Fallback: drop raw text into the first row of this chunk
         if (base >= 0 && base < merged.length) merged[base].result = text;
       }
     }
@@ -100,8 +135,9 @@ export default async (event) => {
     // Serialize merged CSV
     const headers = Object.keys(merged[0] || {});
     const csvStr = await new Promise((resolve, reject) => {
-      csvStringify(merged, { header: true, columns: headers }, (err, outStr) => {
-        if (err) reject(err); else resolve(outStr);
+      csvStringify(merged, { header: true, columns: headers }, (err, out) => {
+        if (err) reject(err);
+        else resolve(out);
       });
     });
 
@@ -110,11 +146,14 @@ export default async (event) => {
       headers: {
         ...CORS,
         "Content-Type": "text/csv",
-        "Content-Disposition": `attachment; filename="${id}.csv"`
-      }
+        "Content-Disposition": `attachment; filename="${id}.csv"`,
+      },
     });
   } catch (e) {
     console.error("batch-download error:", e);
-    return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: CORS });
+    return new Response(JSON.stringify({ error: e.message }), {
+      status: 500,
+      headers: CORS,
+    });
   }
 };
