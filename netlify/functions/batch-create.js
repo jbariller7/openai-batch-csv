@@ -175,15 +175,18 @@ export default async function handler(reqOrEvent) {
         text: String(r?.[inputCol] ?? ""),
       }));
 
-      const body = {
-        model,
-        instructions: `${prompt}${suffix}`,
-        input: JSON.stringify({ rows: firstChunk }),
-        // UPDATED: JSON mode moved under text.format
-        text: { format: { type: "json_object" } },
-        temperature: 0,
-        ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
-      };
+const body = {
+  model,
+  input: [
+    { role: "system", content: `${prompt}${suffix}` },
+    { role: "user", content: "Return only a json object as specified. The output must be valid json." },
+    { role: "user", content: JSON.stringify({ rows: firstChunk }) }
+  ],
+  text: { format: { type: "json_object" } },
+  temperature: 0,
+  ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+};
+
 
       const resp = await client.responses.create(body);
 
@@ -216,17 +219,20 @@ export default async function handler(reqOrEvent) {
         chunks.push(items.slice(i, i + chunkSize));
       }
 
-      function buildBody(rowsChunk) {
-        return {
-          model,
-          instructions: `${prompt}${suffix}`,
-          input: JSON.stringify({ rows: rowsChunk }),
-          // UPDATED: JSON mode moved under text.format
-          text: { format: { type: "json_object" } },
-          temperature: 0,
-          ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
-        };
-      }
+function buildBody(rowsChunk) {
+  return {
+    model,
+    input: [
+      { role: "system", content: `${prompt}${suffix}` },
+      { role: "user", content: "Return only a json object as specified. The output must be valid json." },
+      { role: "user", content: JSON.stringify({ rows: rowsChunk }) }
+    ],
+    text: { format: { type: "json_object" } },
+    temperature: 0,
+    ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+  };
+}
+
 
       // simple concurrency pool
       let i = 0;
@@ -265,15 +271,18 @@ export default async function handler(reqOrEvent) {
         text: String(r?.[inputCol] ?? ""),
       }));
 
-      const body = {
-        model,
-        instructions: `${prompt}${suffix}`,
-        input: JSON.stringify({ rows: chunk }),
-        // UPDATED: JSON mode moved under text.format
-        text: { format: { type: "json_object" } },
-        temperature: 0,
-        ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
-      };
+const body = {
+  model,
+  input: [
+    { role: "system", content: `${prompt}${suffix}` },
+    { role: "user", content: "Return only a json object as specified. The output must be valid json." },
+    { role: "user", content: JSON.stringify({ rows: chunk }) }
+  ],
+  text: { format: { type: "json_object" } },
+  temperature: 0,
+  ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+};
+
 
       lines.push(
         JSON.stringify({
