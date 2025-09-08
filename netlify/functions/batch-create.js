@@ -162,9 +162,11 @@ export default async function handler(reqOrEvent) {
       /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
 
     const suffix =
-      ' You will receive a JSON object {"rows":[{"id":number,"text":string},...]}.'
-      + ' For each item, produce {"id": same id, "result": <string>} following the user instructions above.'
-      + ' Return ONLY a JSON object: {"results":[{"id":number,"result":string},...]} in the SAME ORDER as input. Do not include any commentary.';
+  ' You will receive a json object {"rows":[{"id":number,"text":string},...]}.'
+  + ' For each item, produce {"id": same id, "result": <string>} following the user instructions above.'
+  + ' The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]}'
+  + ' in the SAME ORDER as input. Do not include any commentary.';
+
 
     // 4) DRY RUN: run first chunk immediately with /v1/responses
     if (dryRun) {
