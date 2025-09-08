@@ -5,16 +5,16 @@ import { stringify as csvStringify } from "csv-stringify";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-export const config = { path: "/api/batch-download" };
+export const config = { /* path: "/api/batch-download" */ };
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,OPTIONS",
+  "Access-Control-Allow-Methods": "GET,OPTIONS,HEAD",
   "Access-Control-Allow-Headers": "Content-Type"
 };
 
 export default async (event) => {
-  if (event.httpMethod === "OPTIONS") {
+  if (event.httpMethod === "OPTIONS" || event.httpMethod === "HEAD") {
     return new Response("", { status: 204, headers: CORS });
   }
 
