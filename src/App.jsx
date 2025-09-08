@@ -17,7 +17,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // --- Debug console state ---
+  // --- Debug console ---
   const [logs, setLogs] = useState([]);
   const logRef = useRef(null);
   function log(msg) {
@@ -29,33 +29,21 @@ export default function App() {
   }, [logs]);
 
   const pollRef = useRef(null);
-  function startPolling() {
-    stopPolling();
-    pollRef.current = setInterval(checkStatus, 3000);
-  }
-  function stopPolling() {
-    if (pollRef.current) clearInterval(pollRef.current);
-    pollRef.current = null;
-  }
+  function startPolling() { stopPolling(); pollRef.current = setInterval(checkStatus, 3000); }
+  function stopPolling() { if (pollRef.current) clearInterval(pollRef.current); pollRef.current = null; }
   useEffect(() => {
     const terminal = ["completed", "failed", "cancelled", "expired"];
     if (terminal.includes(status)) stopPolling();
   }, [status]);
 
-  const isGpt5    = model.startsWith("gpt-5");
-  const isOseries = /^o\d/i.test(model) || model.startsWith("o");
+  const isGpt5    = model.startsWith("gpt-5");                 // gpt-5, gpt-5-mini, gpt-5-nano
+  const isOseries = /^o\d/i.test(model) || model.startsWith("o"); // o3, o4-mini, etc.
 
   async function submitBatch(e) {
     e.preventDefault();
-    setError("");
-    setOutputReady(false);
-    setStatus("");
+    setError(""); setOutputReady(false); setStatus("");
 
-    if (!file) {
-      setError("Please choose a CSV file.");
-      log("No file selected.");
-      return;
-    }
+    if (!file) { setError("Please choose a CSV file."); log("No file selected."); return; }
 
     try {
       setIsSubmitting(true);
@@ -71,9 +59,7 @@ export default function App() {
       fd.append("reasoning_effort", reasoningEffort);
       fd.append("verbosity", verbosity);
 
-      log(
-        `Create Batch → model=${model}, inputCol=${inputCol}, K=${chunkSize}, reasoning=${reasoningEffort}${isGpt5 && verbosity ? `, verbosity=${verbosity}` : ""}`
-      );
+      log(`Create Batch → model=${model}, inputCol=${inputCol}, K=${chunkSize}, reasoning=${reasoningEffort}${isGpt5 && verbosity ? `, verbosity=${verbosity}` : ""}`);
       const t0 = performance.now();
       const r = await fetch("/api/batch-create", { method: "POST", body: fd });
 
@@ -93,11 +79,7 @@ export default function App() {
 
       let j = {};
       try { j = JSON.parse(bodyText || "{}"); } catch {}
-      if (!j.batchId) {
-        setError("No batchId returned from server.");
-        log("Error: No batchId in response.");
-        return;
-      }
+      if (!j.batchId) { setError("No batchId returned from server."); log("Error: No batchId in response."); return; }
 
       setBatchId(j.batchId);
       setStatus("submitted");
@@ -118,21 +100,16 @@ export default function App() {
       const r = await fetch(`/api/batch-status?id=${encodeURIComponent(batchId)}`);
       const t = await r.text();
       if (!r.ok) {
-        let msg = t;
-        try { msg = JSON.parse(t).error || msg; } catch {}
+        let msg = t; try { msg = JSON.parse(t).error || msg; } catch {}
         setError(msg || `Status failed (HTTP ${r.status})`);
         log(`Status error: ${msg || `HTTP ${r.status}`}`);
         return;
       }
-      let j = {};
-      try { j = JSON.parse(t); } catch {}
+      let j = {}; try { j = JSON.parse(t); } catch {}
       const s = j.status || "(unknown)";
       setStatus(s);
       log(`Batch ${j.id || batchId} → ${s}`);
-      if (s === "completed") {
-        setOutputReady(true);
-        log("Batch completed. You can download the merged CSV.");
-      }
+      if (s === "completed") { setOutputReady(true); log("Batch completed. You can download the merged CSV."); }
     } catch (err) {
       setError(err?.message || String(err));
       log(`Status exception: ${err?.message || String(err)}`);
@@ -145,37 +122,23 @@ export default function App() {
     window.location.href = `/api/batch-download?id=${encodeURIComponent(batchId)}`;
   }
 
-  function clearLogs() {
-    setLogs([]);
-  }
+  function clearLogs() { setLogs([]); }
   async function copyLogs() {
-    try {
-      await navigator.clipboard.writeText(logs.join("\n"));
-      log("Logs copied to clipboard.");
-    } catch {
-      log("Copy failed (clipboard permissions).");
-    }
+    try { await navigator.clipboard.writeText(logs.join("\n")); log("Logs copied to clipboard."); }
+    catch { log("Copy failed (clipboard permissions)."); }
   }
 
   return (
     <div className="container" style={{ maxWidth: 920, margin: "40px auto", fontFamily: "system-ui, sans-serif" }}>
       <h1>OpenAI Batch CSV</h1>
-      <p>
-        Upload a CSV, choose the input column, write your instruction, pick a model, set <em>Rows per request (K)</em>, then create a Batch.
-        Watch the <strong>Console</strong> below for live progress and errors.
-      </p>
+      <p>Upload a CSV, choose the input column, write your instruction, pick a model, set <em>Rows per request (K)</em>, then create a Batch. Watch the <strong>Console</strong> below for live progress.</p>
 
       <form onSubmit={submitBatch} style={{ display: "grid", gap: 12 }}>
         <label>CSV File
-          <input
-            type="file"
-            accept=".csv"
-            onChange={(e) => {
-              const f = e.target.files?.[0] || null;
-              setFile(f);
-              if (f) log(`Selected file: ${f.name} (${f.size.toLocaleString()} bytes)`);
-            }}
-          />
+          <input type="file" accept=".csv" onChange={(e) => {
+            const f = e.target.files?.[0] || null; setFile(f);
+            if (f) log(`Selected file: ${f.name} (${f.size.toLocaleString()} bytes)`);
+          }}/>
         </label>
 
         <label>Input column name
@@ -188,10 +151,10 @@ export default function App() {
 
         <label>Model
           <select value={model} onChange={(e) => setModel(e.target.value)}>
-            {/* Add gpt-5 variants if your org has access */}
-            {/* <option>gpt-5</option>
+            {/* Add GPT-5 options if your org has access */}
+            <option>gpt-5</option>
             <option>gpt-5-mini</option>
-            <option>gpt-5-nano</option> */}
+            <option>gpt-5-nano</option>
             <option>gpt-4.1-mini</option>
             <option>gpt-4o-mini</option>
             <option>gpt-4.1</option>
@@ -221,13 +184,8 @@ export default function App() {
         )}
 
         <label>Rows per request (K)
-          <input
-            type="number"
-            min={1}
-            max={1000}
-            value={chunkSize}
-            onChange={(e) => setChunkSize(Number(e.target.value || 1))}
-          />
+          <input type="number" min={1} max={1000} value={chunkSize}
+                 onChange={(e) => setChunkSize(Number(e.target.value || 1))}/>
         </label>
 
         <button type="submit" disabled={isSubmitting} style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
@@ -238,7 +196,7 @@ export default function App() {
       {batchId && (
         <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
           <div><strong>Batch ID:</strong> {batchId}</div>
-          <div><strong>Status:</strong> {status || "(unknown)"} </div>
+          <div><strong>Status:</strong> {status || "(unknown)"}</div>
           <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
             <button onClick={checkStatus}>Refresh Status</button>
             <button onClick={downloadOutput} disabled={!outputReady}>Download merged CSV</button>
@@ -247,29 +205,21 @@ export default function App() {
         </div>
       )}
 
-      {/* Debug Console */}
       <div style={{ marginTop: 24 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
           <h2 style={{ margin: 0, fontSize: 18 }}>Console</h2>
           <div style={{ display: "flex", gap: 8 }}>
             <button type="button" onClick={clearLogs}>Clear</button>
-            <button type="button" onClick={copyLogs}>Copy</button>
+            <button type="button" onClick={async () => {
+              try { await navigator.clipboard.writeText(logs.join("\n")); log("Logs copied to clipboard."); }
+              catch { log("Copy failed (clipboard permissions)."); }
+            }}>Copy</button>
           </div>
         </div>
-        <pre
-          ref={logRef}
-          style={{
-            background: "#0b1020",
-            color: "#d7e3ff",
-            padding: 12,
-            borderRadius: 8,
-            maxHeight: 260,
-            overflow: "auto",
-            whiteSpace: "pre-wrap",
-            fontSize: 13,
-            lineHeight: 1.45,
-          }}
-        >
+        <pre ref={logRef} style={{
+          background: "#0b1020", color: "#d7e3ff", padding: 12, borderRadius: 8,
+          maxHeight: 260, overflow: "auto", whiteSpace: "pre-wrap", fontSize: 13, lineHeight: 1.45
+        }}>
 {logs.length ? logs.join("\n") : "Console will show progress, HTTP codes, and errors…"}
         </pre>
       </div>
