@@ -1,11 +1,13 @@
-import OpenAI from "openai";
+// netlify/functions/batch-create.js (ESM)
+
+import OpenAI, { toFile } from "openai";
 import { getStore } from "@netlify/blobs";
 import Busboy from "busboy";
 import { parse as csvParse } from "csv-parse";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Works in both runtimes; path config is optional when calling /.netlify/functions/*
+// Optional path config when invoking as /.netlify/functions/*
 export const config = { /* path: "/api/batch-create" */ };
 
 const CORS = {
@@ -14,18 +16,17 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-function getMethod(req) {
-  if (req && typeof req.method === "string") return req.method;           // Request (Deno)
-  if (req && typeof req.httpMethod === "string") return req.httpMethod;   // event (Node)
+// Helpers to support both Netlify Node (event) and Web Request shapes
+function getMethod(reqOrEvent) {
+  if (reqOrEvent && typeof reqOrEvent.method === "string") return reqOrEvent.method;         // Web/Deno
+  if (reqOrEvent && typeof reqOrEvent.httpMethod === "string") return reqOrEvent.httpMethod; // Node/event
   return "GET";
 }
-function getUrl(req) {
-  return typeof req.url === "string" ? req.url : (req.rawUrl || "");
+function hasFormData(reqOrEvent) {
+  return reqOrEvent && typeof reqOrEvent.formData === "function"; // Web/Deno
 }
-function hasFormData(req) {
-  return req && typeof req.formData === "function"; // Request (Deno/Web)
-}
-// Node/event → parse multipart with Busboy
+
+// Parse multipart for Node/event using Busboy
 function parseMultipartEvent(event) {
   return new Promise((resolve, reject) => {
     const bb = Busboy({
@@ -36,6 +37,7 @@ function parseMultipartEvent(event) {
           "",
       },
     });
+
     const fields = {};
     let fileBuffers = [];
     let fileInfo = null;
@@ -62,25 +64,26 @@ function parseMultipartEvent(event) {
   });
 }
 
-export default async (reqOrEvent) => {
+export default async function handler(reqOrEvent) {
   const method = getMethod(reqOrEvent);
+
   if (method === "OPTIONS" || method === "HEAD") {
     return new Response("", { status: 204, headers: CORS });
   }
   if (method !== "POST") {
     return new Response(JSON.stringify({ error: "POST only" }), {
       status: 405,
-      headers: CORS,
+      headers: { ...CORS, "Content-Type": "application/json" },
     });
   }
 
   try {
-    // 1) Parse multipart form (Deno/Web API first, Node fallback)
+    // 1) Parse multipart form
     let fields = {};
     let fileBuffer = null;
 
     if (hasFormData(reqOrEvent)) {
-      // Deno/Web API
+      // Web API (Deno-like Request)
       const form = await reqOrEvent.formData();
       for (const [k, v] of form.entries()) {
         if (v && typeof v.arrayBuffer === "function") {
@@ -102,46 +105,54 @@ export default async (reqOrEvent) => {
     const prompt = fields.prompt || "Translate to English.";
     const completionWindow = fields.completionWindow || "24h";
     const chunkSize = Math.max(1, Math.min(1000, Number(fields.chunkSize || 200)));
-    const reasoningEffort = (fields.reasoning_effort || "").trim(); // minimal|low|medium|high
-    const verbosity = (fields.verbosity || "").trim();               // "", low|medium|high (GPT-5)
+    const reasoningEffort = (fields.reasoning_effort || "").trim(); // "low" | "medium" | "high"
+    // Note: verbosity is no longer used
+    const verbosity = (fields.verbosity || "").trim();
 
     if (!fileBuffer) {
       return new Response(JSON.stringify({ error: "CSV file is required" }), {
         status: 400,
-        headers: CORS,
+        headers: { ...CORS, "Content-Type": "application/json" },
       });
     }
 
-    // 2) Store original CSV
+    // 2) Store original CSV in Netlify Blobs
     const jobId = crypto.randomUUID();
     const store = getStore("openai-batch-csv");
     await store.set(`csv/${jobId}.csv`, fileBuffer);
 
-    // 3) Parse CSV → rows[]
+    // 3) Parse CSV
     const rows = await new Promise((resolve, reject) => {
       const out = [];
-      csvParse(fileBuffer, { columns: true, relax_quotes: true })
+      csvParse(fileBuffer, {
+        columns: true,
+        relax_quotes: true,
+        skip_empty_lines: true,
+        bom: true,
+      })
         .on("data", (r) => out.push(r))
         .on("end", () => resolve(out))
         .on("error", reject);
     });
+
     if (!rows.length) {
       return new Response(JSON.stringify({ error: "CSV has no rows" }), {
         status: 400,
-        headers: CORS,
+        headers: { ...CORS, "Content-Type": "application/json" },
       });
     }
 
-    // 4) Build JSONL lines (micro-batches of K)
-    const isGpt5 = model.startsWith("gpt-5");
-    const isOseries = /^o\d/i.test(model) || model.startsWith("o");
+    // 4) Build JSONL lines in chunks
+    const supportsReasoning =
+      /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
 
     const suffix =
-      ' You will receive a JSON object {"rows":[{"id":number,"text":string},...]}.' +
-      ' For each item, produce {"id": same id, "result": <string>} following the user instructions above.' +
-      ' Return ONLY a JSON object: {"results":[{"id":number,"result":string},...]} in the SAME ORDER as input. Do not include any commentary.';
+      ' You will receive a JSON object {"rows":[{"id":number,"text":string},...]}.'
+      + ' For each item, produce {"id": same id, "result": <string>} following the user instructions above.'
+      + ' Return ONLY a JSON object: {"results":[{"id":number,"result":string},...]} in the SAME ORDER as input. Do not include any commentary.';
 
     const lines = [];
+
     for (let start = 0; start < rows.length; start += chunkSize) {
       const chunk = rows.slice(start, start + chunkSize).map((r, j) => ({
         id: start + j,
@@ -150,14 +161,14 @@ export default async (reqOrEvent) => {
 
       const body = {
         model,
-        input: [
-          { role: "system", content: `${prompt}${suffix}` },
-          { role: "user", content: JSON.stringify({ rows: chunk }) },
-        ],
-        text_format: { type: "json_object" },
+        // Use Responses API idioms: general instructions + one user input blob
+        instructions: `${prompt}${suffix}`,
+        input: JSON.stringify({ rows: chunk }),
+        response_format: { type: "json_object" },
         temperature: 0,
-        ...(((isGpt5 || isOseries) && reasoningEffort) ? { reasoning_effort: reasoningEffort } : {}),
-        ...(isGpt5 && verbosity ? { text: { verbosity } } : {}),
+        ...(supportsReasoning && reasoningEffort
+          ? { reasoning: { effort: reasoningEffort } }
+          : {}),
       };
 
       lines.push(
@@ -172,9 +183,9 @@ export default async (reqOrEvent) => {
 
     const jsonlBuffer = Buffer.from(lines.join("\n"), "utf8");
 
-    // 5) Upload JSONL to OpenAI (use Web File API for cross-runtime compatibility)
+    // 5) Upload JSONL using SDK helper for cross-runtime compatibility
     const jsonlFile = await client.files.create({
-      file: new File([jsonlBuffer], `${jobId}.jsonl`, {
+      file: await toFile(jsonlBuffer, `${jobId}.jsonl`, {
         type: "application/jsonl",
       }),
       purpose: "batch",
@@ -184,10 +195,10 @@ export default async (reqOrEvent) => {
     const batch = await client.batches.create({
       input_file_id: jsonlFile.id,
       endpoint: "/v1/responses",
-      completion_window: completionWindow,
+      completion_window: completionWindow, // eg "24h"
     });
 
-    // 7) Persist job meta
+    // 7) Persist job metadata
     await store.setJSON(`jobs/${batch.id}.json`, {
       jobId,
       batchId: batch.id,
@@ -196,7 +207,7 @@ export default async (reqOrEvent) => {
       prompt,
       chunkSize,
       reasoningEffort,
-      verbosity,
+      verbosity, // kept only for your logs
       createdAt: new Date().toISOString(),
     });
 
@@ -206,9 +217,9 @@ export default async (reqOrEvent) => {
     );
   } catch (err) {
     console.error("batch-create error:", err);
-    return new Response(JSON.stringify({ error: err.message }), {
-      status: 500,
-      headers: CORS,
-    });
+    return new Response(
+      JSON.stringify({ error: err?.message || String(err) }),
+      { status: 500, headers: { ...CORS, "Content-Type": "application/json" } }
+    );
   }
-};
+}
