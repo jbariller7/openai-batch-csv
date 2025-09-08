@@ -1,4 +1,4 @@
-// netlify/functions/batch-create.js (ESM)
+// netlify/functions/batch-create.js  (ESM)
 
 import OpenAI, { toFile } from "openai";
 import { getStore } from "@netlify/blobs";
@@ -7,7 +7,7 @@ import { parse as csvParse } from "csv-parse";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Optional path config when invoking as /.netlify/functions/*
+// Optional pretty path when invoking as /.netlify/functions/*
 export const config = { /* path: "/api/batch-create" */ };
 
 const CORS = {
@@ -16,14 +16,26 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-// Helpers to support both Netlify Node (event) and Web Request shapes
 function getMethod(reqOrEvent) {
   if (reqOrEvent && typeof reqOrEvent.method === "string") return reqOrEvent.method;         // Web/Deno
   if (reqOrEvent && typeof reqOrEvent.httpMethod === "string") return reqOrEvent.httpMethod; // Node/event
   return "GET";
 }
 function hasFormData(reqOrEvent) {
-  return reqOrEvent && typeof reqOrEvent.formData === "function"; // Web/Deno
+  return reqOrEvent && typeof reqOrEvent.formData === "function";
+}
+function getQuery(reqOrEvent) {
+  // Node/event
+  if (reqOrEvent && typeof reqOrEvent.queryStringParameters === "object") {
+    return reqOrEvent.queryStringParameters || {};
+  }
+  // Web Request
+  try {
+    const url = typeof reqOrEvent?.url === "string" ? new URL(reqOrEvent.url) : null;
+    return url ? Object.fromEntries(url.searchParams.entries()) : {};
+  } catch {
+    return {};
+  }
 }
 
 // Parse multipart for Node/event using Busboy
@@ -66,6 +78,7 @@ function parseMultipartEvent(event) {
 
 export default async function handler(reqOrEvent) {
   const method = getMethod(reqOrEvent);
+  const query = getQuery(reqOrEvent);
 
   if (method === "OPTIONS" || method === "HEAD") {
     return new Response("", { status: 204, headers: CORS });
@@ -106,8 +119,12 @@ export default async function handler(reqOrEvent) {
     const completionWindow = fields.completionWindow || "24h";
     const chunkSize = Math.max(1, Math.min(1000, Number(fields.chunkSize || 200)));
     const reasoningEffort = (fields.reasoning_effort || "").trim(); // "low" | "medium" | "high"
-    // Note: verbosity is no longer used
-    const verbosity = (fields.verbosity || "").trim();
+
+    // Testing flags (can be set by form fields or query params)
+    const maxRows = Number(fields.maxRows || query.maxRows || 0) || 0;
+    const dryRun = String(fields.dryRun || query.dryRun || "") === "1";
+    const direct = String(fields.direct || query.direct || "") === "1";
+    const concurrency = Math.max(1, Math.min(8, Number(fields.concurrency || query.concurrency || 4)));
 
     if (!fileBuffer) {
       return new Response(JSON.stringify({ error: "CSV file is required" }), {
@@ -142,7 +159,7 @@ export default async function handler(reqOrEvent) {
       });
     }
 
-    // 4) Build JSONL lines in chunks
+    const effectiveRows = maxRows > 0 ? rows.slice(0, maxRows) : rows;
     const supportsReasoning =
       /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
 
@@ -151,24 +168,108 @@ export default async function handler(reqOrEvent) {
       + ' For each item, produce {"id": same id, "result": <string>} following the user instructions above.'
       + ' Return ONLY a JSON object: {"results":[{"id":number,"result":string},...]} in the SAME ORDER as input. Do not include any commentary.';
 
-    const lines = [];
+    // 4) DRY RUN: run first chunk immediately with /v1/responses
+    if (dryRun) {
+      const firstChunk = effectiveRows.slice(0, chunkSize).map((r, j) => ({
+        id: j,
+        text: String(r?.[inputCol] ?? ""),
+      }));
 
-    for (let start = 0; start < rows.length; start += chunkSize) {
-      const chunk = rows.slice(start, start + chunkSize).map((r, j) => ({
+      const body = {
+        model,
+        instructions: `${prompt}${suffix}`,
+        input: JSON.stringify({ rows: firstChunk }),
+        response_format: { type: "json_object" },
+        temperature: 0,
+        ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+      };
+
+      const resp = await client.responses.create(body);
+
+      let parsed = null;
+      try { parsed = JSON.parse(resp.output_text || ""); } catch {}
+
+      return new Response(
+        JSON.stringify({
+          mode: "dryRun",
+          jobId,
+          usedRows: firstChunk.length,
+          model,
+          response: resp,
+          parsed,
+        }),
+        { status: 200, headers: { ...CORS, "Content-Type": "application/json" } }
+      );
+    }
+
+    // 5) DIRECT: process the whole CSV now with parallel /v1/responses
+    if (direct) {
+      const items = effectiveRows.map((r, idx) => ({
+        id: idx,
+        text: String(r?.[inputCol] ?? ""),
+      }));
+
+      // chunk
+      const chunks = [];
+      for (let i = 0; i < items.length; i += chunkSize) {
+        chunks.push(items.slice(i, i + chunkSize));
+      }
+
+      function buildBody(rowsChunk) {
+        return {
+          model,
+          instructions: `${prompt}${suffix}`,
+          input: JSON.stringify({ rows: rowsChunk }),
+          response_format: { type: "json_object" },
+          temperature: 0,
+          ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+        };
+      }
+
+      // simple concurrency pool
+      let i = 0;
+      const results = new Array(chunks.length);
+      async function worker() {
+        while (i < chunks.length) {
+          const my = i++;
+          const resp = await client.responses.create(buildBody(chunks[my]));
+          let parsed = null;
+          try { parsed = JSON.parse(resp.output_text || ""); } catch {}
+          results[my] = parsed;
+        }
+      }
+      await Promise.all(Array.from({ length: concurrency }, worker));
+
+      // flatten {"results":[...]} blocks
+      const merged = [];
+      for (const part of results) if (part?.results) merged.push(...part.results);
+
+      // store merged for inspection if you want
+      await store.setJSON(`results/${jobId}.json`, {
+        jobId, model, rowCount: effectiveRows.length, results: merged,
+      });
+
+      return new Response(
+        JSON.stringify({ mode: "direct", jobId, model, rowCount: effectiveRows.length, results: merged }),
+        { status: 200, headers: { ...CORS, "Content-Type": "application/json" } }
+      );
+    }
+
+    // 6) BATCH: build JSONL lines and enqueue
+    const lines = [];
+    for (let start = 0; start < effectiveRows.length; start += chunkSize) {
+      const chunk = effectiveRows.slice(start, start + chunkSize).map((r, j) => ({
         id: start + j,
         text: String(r?.[inputCol] ?? ""),
       }));
 
       const body = {
         model,
-        // Use Responses API idioms: general instructions + one user input blob
         instructions: `${prompt}${suffix}`,
         input: JSON.stringify({ rows: chunk }),
         response_format: { type: "json_object" },
         temperature: 0,
-        ...(supportsReasoning && reasoningEffort
-          ? { reasoning: { effort: reasoningEffort } }
-          : {}),
+        ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
       };
 
       lines.push(
@@ -183,22 +284,20 @@ export default async function handler(reqOrEvent) {
 
     const jsonlBuffer = Buffer.from(lines.join("\n"), "utf8");
 
-    // 5) Upload JSONL using SDK helper for cross-runtime compatibility
+    // Upload JSONL using SDK helper for cross-runtime compatibility
     const jsonlFile = await client.files.create({
-      file: await toFile(jsonlBuffer, `${jobId}.jsonl`, {
-        type: "application/jsonl",
-      }),
+      file: await toFile(jsonlBuffer, `${jobId}.jsonl`, { type: "application/jsonl" }),
       purpose: "batch",
     });
 
-    // 6) Create Batch
+    // Create Batch
     const batch = await client.batches.create({
       input_file_id: jsonlFile.id,
       endpoint: "/v1/responses",
-      completion_window: completionWindow, // eg "24h"
+      completion_window: completionWindow, // "24h" or "4h"
     });
 
-    // 7) Persist job metadata
+    // Persist job metadata
     await store.setJSON(`jobs/${batch.id}.json`, {
       jobId,
       batchId: batch.id,
@@ -207,12 +306,12 @@ export default async function handler(reqOrEvent) {
       prompt,
       chunkSize,
       reasoningEffort,
-      verbosity, // kept only for your logs
       createdAt: new Date().toISOString(),
+      rowCount: effectiveRows.length,
     });
 
     return new Response(
-      JSON.stringify({ batchId: batch.id, jobId }),
+      JSON.stringify({ mode: "batch", batchId: batch.id, jobId }),
       { status: 200, headers: { ...CORS, "Content-Type": "application/json" } }
     );
   } catch (err) {
