@@ -7,27 +7,37 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 export const config = { path: "/api/batch-download" };
 
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type"
+};
+
 export default async (event) => {
+  if (event.httpMethod === "OPTIONS") {
+    return new Response("", { status: 204, headers: CORS });
+  }
+
   const url = new URL(event.rawUrl);
   const id = url.searchParams.get("id");
-  if (!id) return new Response(JSON.stringify({ error: "Missing id" }), { status: 400 });
+  if (!id) return new Response(JSON.stringify({ error: "Missing id" }), { status: 400, headers: CORS });
 
   try {
     const b = await client.batches.retrieve(id);
     if (b.status !== "completed") {
-      return new Response(JSON.stringify({ error: `Batch not completed. Status: ${b.status}` }), { status: 400 });
+      return new Response(JSON.stringify({ error: `Batch not completed. Status: ${b.status}` }), { status: 400, headers: CORS });
     }
     if (!b.output_file_id) {
-      return new Response(JSON.stringify({ error: "No output file id" }), { status: 400 });
+      return new Response(JSON.stringify({ error: "No output file id" }), { status: 400, headers: CORS });
     }
 
     const store = getStore("openai-batch-csv");
     const meta = await store.getJSON(`jobs/${id}.json`);
-    if (!meta) return new Response(JSON.stringify({ error: "Job metadata not found" }), { status: 404 });
+    if (!meta) return new Response(JSON.stringify({ error: "Job metadata not found" }), { status: 404, headers: CORS });
 
     // Read original CSV rows
     const csvBuf = await store.get(`csv/${meta.jobId}.csv`, { type: "buffer" });
-    if (!csvBuf) return new Response(JSON.stringify({ error: "Original CSV not found" }), { status: 404 });
+    if (!csvBuf) return new Response(JSON.stringify({ error: "Original CSV not found" }), { status: 404, headers: CORS });
 
     const rows = await new Promise((resolve, reject) => {
       const out = [];
@@ -91,20 +101,20 @@ export default async (event) => {
     const headers = Object.keys(merged[0] || {});
     const csvStr = await new Promise((resolve, reject) => {
       csvStringify(merged, { header: true, columns: headers }, (err, outStr) => {
-        if (err) reject(err);
-        else resolve(outStr);
+        if (err) reject(err); else resolve(outStr);
       });
     });
 
     return new Response(csvStr, {
       status: 200,
       headers: {
+        ...CORS,
         "Content-Type": "text/csv",
         "Content-Disposition": `attachment; filename="${id}.csv"`
       }
     });
   } catch (e) {
     console.error("batch-download error:", e);
-    return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+    return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: CORS });
   }
 };
