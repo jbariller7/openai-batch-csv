@@ -182,9 +182,10 @@ const body = {
     { role: "user", content: "Return only a json object as specified. The output must be valid json." },
     { role: "user", content: JSON.stringify({ rows: firstChunk }) }
   ],
-  text: { format: { type: "json_object" } },
-  temperature: 0,
-  ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+text: { format: { type: "json_object" } },
+...(supportsTemperature(model) ? { temperature: 0 } : {}),
+...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+
 };
 
 
@@ -227,9 +228,10 @@ function buildBody(rowsChunk) {
       { role: "user", content: "Return only a json object as specified. The output must be valid json." },
       { role: "user", content: JSON.stringify({ rows: rowsChunk }) }
     ],
-    text: { format: { type: "json_object" } },
-    temperature: 0,
-    ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+text: { format: { type: "json_object" } },
+...(supportsTemperature(model) ? { temperature: 0 } : {}),
+...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+
   };
 }
 
@@ -278,9 +280,10 @@ const body = {
     { role: "user", content: "Return only a json object as specified. The output must be valid json." },
     { role: "user", content: JSON.stringify({ rows: chunk }) }
   ],
-  text: { format: { type: "json_object" } },
-  temperature: 0,
-  ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+text: { format: { type: "json_object" } },
+...(supportsTemperature(model) ? { temperature: 0 } : {}),
+...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+
 };
 
 
