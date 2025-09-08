@@ -47,6 +47,8 @@ export default async (event) => {
     const prompt = fields.prompt || "Translate to English.";
     const completionWindow = fields.completionWindow || "24h";
     const chunkSize = Math.max(1, Math.min(1000, Number(fields.chunkSize || 200))); // K
+    const reasoningEffort = (fields.reasoning_effort || '').trim(); // minimal|low|medium|high
+const verbosity = (fields.verbosity || '').trim();              // "", low|medium|high
 
     if (!fileBuffer) return new Response(JSON.stringify({ error: "CSV file is required" }), { status: 400 });
 
@@ -80,15 +82,21 @@ export default async (event) => {
         text: String(r?.[inputCol] ?? "")
       }));
 
-      const body = {
-        model,
-        input: [
-          { role: "system", content: `${prompt}${suffix}` },
-          { role: "user", content: JSON.stringify({ rows: chunk }) }
-        ],
-        response_format: { type: "json_object" },
-        temperature: 0
-      };
+const isGpt5 = model.startsWith('gpt-5');          // gpt-5, gpt-5-mini, gpt-5-nano
+const isOseries = model.startsWith('o');           // o3, o4-mini, etc.
+
+const body = {
+  model,
+  input: [
+    { role: "system", content: `${prompt}${suffix}` },
+    { role: "user", content: JSON.stringify({ rows: chunk }) }
+  ],
+  response_format: { type: "json_object" },
+  temperature: 0,
+  ...( (isGpt5 || isOseries) && reasoningEffort ? { reasoning_effort: reasoningEffort } : {} ),
+  ...( isGpt5 && verbosity ? { text: { verbosity } } : {} )
+};
+
 
       lines.push(JSON.stringify({
         custom_id: String(start), // helps us map results if ids are missing
