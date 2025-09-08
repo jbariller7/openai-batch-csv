@@ -148,7 +148,7 @@ export default async (reqOrEvent) => {
           { role: "system", content: `${prompt}${suffix}` },
           { role: "user", content: JSON.stringify({ rows: chunk }) },
         ],
-        response_format: { type: "json_object" },
+        text_format: { type: "json_object" },
         temperature: 0,
         ...(((isGpt5 || isOseries) && reasoningEffort)
           ? { reasoning_effort: reasoningEffort }
