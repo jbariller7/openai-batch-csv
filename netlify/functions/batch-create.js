@@ -17,19 +17,17 @@ const CORS = {
 };
 
 function getMethod(reqOrEvent) {
-  if (reqOrEvent && typeof reqOrEvent.method === "string") return reqOrEvent.method;         // Web/Deno
-  if (reqOrEvent && typeof reqOrEvent.httpMethod === "string") return reqOrEvent.httpMethod; // Node/event
+  if (reqOrEvent && typeof reqOrEvent.method === "string") return reqOrEvent.method;
+  if (reqOrEvent && typeof reqOrEvent.httpMethod === "string") return reqOrEvent.httpMethod;
   return "GET";
 }
 function hasFormData(reqOrEvent) {
   return reqOrEvent && typeof reqOrEvent.formData === "function";
 }
 function getQuery(reqOrEvent) {
-  // Node/event
   if (reqOrEvent && typeof reqOrEvent.queryStringParameters === "object") {
     return reqOrEvent.queryStringParameters || {};
   }
-  // Web Request
   try {
     const url = typeof reqOrEvent?.url === "string" ? new URL(reqOrEvent.url) : null;
     return url ? Object.fromEntries(url.searchParams.entries()) : {};
@@ -118,7 +116,7 @@ export default async function handler(reqOrEvent) {
     const prompt = fields.prompt || "Translate to English.";
     const completionWindow = fields.completionWindow || "24h";
     const chunkSize = Math.max(1, Math.min(1000, Number(fields.chunkSize || 200)));
-    const reasoningEffort = (fields.reasoning_effort || "").trim(); // "low" | "medium" | "high"
+    const reasoningEffort = (fields.reasoning_effort || "").trim(); // "minimal" | "low" | "medium" | "high"
 
     // Testing flags (can be set by form fields or query params)
     const maxRows = Number(fields.maxRows || query.maxRows || 0) || 0;
@@ -179,7 +177,8 @@ export default async function handler(reqOrEvent) {
         model,
         instructions: `${prompt}${suffix}`,
         input: JSON.stringify({ rows: firstChunk }),
-        response_format: { type: "json_object" },
+        // UPDATED: JSON mode moved under text.format
+        text: { format: { type: "json_object" } },
         temperature: 0,
         ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
       };
@@ -220,7 +219,8 @@ export default async function handler(reqOrEvent) {
           model,
           instructions: `${prompt}${suffix}`,
           input: JSON.stringify({ rows: rowsChunk }),
-          response_format: { type: "json_object" },
+          // UPDATED: JSON mode moved under text.format
+          text: { format: { type: "json_object" } },
           temperature: 0,
           ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
         };
@@ -267,7 +267,8 @@ export default async function handler(reqOrEvent) {
         model,
         instructions: `${prompt}${suffix}`,
         input: JSON.stringify({ rows: chunk }),
-        response_format: { type: "json_object" },
+        // UPDATED: JSON mode moved under text.format
+        text: { format: { type: "json_object" } },
         temperature: 0,
         ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
       };
