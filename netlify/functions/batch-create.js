@@ -8,11 +8,12 @@ import path from "node:path";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-export const config = { path: "/api/batch-create" };
+// optional: you can remove config.path, since we now call /.netlify/functions/batch-create
+export const config = { /* path: "/api/batch-create" */ };
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST,OPTIONS",
+  "Access-Control-Allow-Methods": "POST,OPTIONS,HEAD",
   "Access-Control-Allow-Headers": "Content-Type"
 };
 
@@ -28,7 +29,7 @@ function parseMultipart(event) {
     let fileInfo = null;
 
     bb.on("file", (_name, file, info) => {
-      fileInfo = info;
+      fileInfo = info; // { filename, mimeType, encoding }
       file.on("data", (d) => fileBuffers.push(d));
     });
 
@@ -45,7 +46,7 @@ function parseMultipart(event) {
 }
 
 export default async (event) => {
-  if (event.httpMethod === "OPTIONS") {
+  if (event.httpMethod === "OPTIONS" || event.httpMethod === "HEAD") {
     return new Response("", { status: 204, headers: CORS });
   }
   if (event.httpMethod !== "POST") {
