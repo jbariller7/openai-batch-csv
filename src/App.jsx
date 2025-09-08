@@ -1,108 +1,101 @@
-import { useState } from "react";
+import React, { useState } from 'react';
 
-function App() {
+export default function App() {
   const [file, setFile] = useState(null);
-  const [inputCol, setInputCol] = useState("text");
-  const [prompt, setPrompt] = useState("Translate to English.");
-  const [model, setModel] = useState("gpt-4.1-mini");
-  const [status, setStatus] = useState("");
-  const [batchId, setBatchId] = useState("");
-  const [error, setError] = useState("");
+  const [inputCol, setInputCol] = useState('text');
+  const [prompt, setPrompt] = useState('Translate the user input into English.');
+  const [model, setModel] = useState('gpt-4.1-mini');
+  const [chunkSize, setChunkSize] = useState(200); // NEW: rows per request (K)
+  const [batchId, setBatchId] = useState('');
+  const [status, setStatus] = useState('');
   const [outputReady, setOutputReady] = useState(false);
+  const [error, setError] = useState('');
 
-  const handleSubmit = async (e) => {
+  async function submitBatch(e) {
     e.preventDefault();
-    setError("");
-    if (!file) {
-      setError("Please select a CSV file.");
-      return;
-    }
+    setError('');
+    setOutputReady(false);
+
+    if (!file) { setError('Please choose a CSV file.'); return; }
+
     const formData = new FormData();
-    formData.append("file", file);
-    formData.append("inputCol", inputCol);
-    formData.append("prompt", prompt);
-    formData.append("model", model);
-    try {
-      const res = await fetch("/api/batch-create", { method: "POST", body: formData });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || "Error starting batch.");
-        return;
-      }
-      setBatchId(data.batchId);
-      setStatus("submitted");
-    } catch (err) {
-      setError(err.message);
-    }
-  };
+    formData.append('file', file);
+    formData.append('inputCol', inputCol);
+    formData.append('prompt', prompt);
+    formData.append('model', model);
+    formData.append('chunkSize', String(chunkSize)); // NEW
 
-  const checkStatus = async () => {
+    const r = await fetch('/api/batch-create', { method: 'POST', body: formData });
+    const j = await r.json();
+    if (!r.ok) { setError(j.error || 'Failed to create batch'); return; }
+    setBatchId(j.batchId);
+    setStatus('submitted');
+  }
+
+  async function checkStatus() {
     if (!batchId) return;
-    try {
-      const res = await fetch(`/api/batch-status?id=${batchId}`);
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || "Error checking status.");
-        return;
-      }
-      setStatus(data.status);
-      if (data.status === "completed") {
-        setOutputReady(true);
-      }
-    } catch (err) {
-      setError(err.message);
-    }
-  };
+    const r = await fetch(`/api/batch-status?id=${encodeURIComponent(batchId)}`);
+    const j = await r.json();
+    if (!r.ok) { setError(j.error || 'Failed to get status'); return; }
+    setStatus(j.status);
+    setOutputReady(j.status === 'completed');
+  }
 
-  const download = () => {
-    window.location.href = `/api/batch-download?id=${batchId}`;
-  };
+  function downloadOutput() {
+    if (!batchId) return;
+    window.location.href = `/api/batch-download?id=${encodeURIComponent(batchId)}`;
+  }
 
   return (
-    <div style={{ maxWidth: "600px", margin: "0 auto", padding: "1rem" }}>
+    <div className="container" style={{ maxWidth: 820, margin: '40px auto', fontFamily: 'system-ui, sans-serif' }}>
       <h1>OpenAI Batch CSV</h1>
-      <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-        <input type="file" accept=".csv" onChange={(e) => setFile(e.target.files[0])} />
-        <label>
-          Input column name:
+      <p>Upload a CSV, set the input column, write your instruction, pick a model, set <em>rows per request (K)</em>, submit a Batch, then download the merged CSV.</p>
+
+      <form onSubmit={submitBatch} style={{ display: 'grid', gap: 12 }}>
+        <label>CSV File
+          <input type="file" accept=".csv" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+        </label>
+
+        <label>Input column name
+          <input value={inputCol} onChange={(e) => setInputCol(e.target.value)} placeholder="text" />
+        </label>
+
+        <label>Instruction prompt
+          <textarea rows={6} value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="Describe what to do with each row..." />
+        </label>
+
+        <label>Model
+          <select value={model} onChange={(e) => setModel(e.target.value)}>
+            <option>gpt-4.1-mini</option>
+            <option>gpt-4o-mini</option>
+            <option>gpt-4.1</option>
+          </select>
+        </label>
+
+        <label>Rows per request (K)
           <input
-            type="text"
-            value={inputCol}
-            onChange={(e) => setInputCol(e.target.value)}
-            placeholder="Column to process"
-            style={{ width: "100%" }}
+            type="number"
+            min={1}
+            max={1000}
+            value={chunkSize}
+            onChange={(e) => setChunkSize(Number(e.target.value || 1))}
           />
         </label>
-        <label>
-          Prompt:
-          <textarea
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            style={{ width: "100%", height: "120px" }}
-          />
-        </label>
-        <label>
-          Model:
-          <input
-            type="text"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            placeholder="gpt-4.1-mini"
-            style={{ width: "100%" }}
-          />
-        </label>
-        <button type="submit">Submit Batch</button>
+
+        <button type="submit">Create Batch</button>
       </form>
-      {status && (
-        <p>
-          <strong>Status:</strong> {status}
-        </p>
+
+      {batchId && (
+        <div style={{ marginTop: 24, padding: 12, border: '1px solid #ddd', borderRadius: 8 }}>
+          <div><strong>Batch ID:</strong> {batchId}</div>
+          <div><strong>Status:</strong> {status || '(unknown)'} </div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <button onClick={checkStatus}>Refresh Status</button>
+            <button onClick={downloadOutput} disabled={!outputReady}>Download merged CSV</button>
+          </div>
+          {error && <p style={{ color: 'crimson' }}>{error}</p>}
+        </div>
       )}
-      {batchId && <button onClick={checkStatus}>Refresh Status</button>}
-      {outputReady && <button onClick={download}>Download Result</button>}
-      {error && <p style={{ color: "red" }}>{error}</p>}
     </div>
   );
 }
-
-export default App;
