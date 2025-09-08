@@ -35,15 +35,21 @@ export default async (reqOrEvent) => {
 
   try {
     const b = await client.batches.retrieve(id);
-    return new Response(
-      JSON.stringify({
-        id: b.id,
-        status: b.status,
-        created_at: b.created_at,
-        output_file_id: b.output_file_id || null,
-      }),
-      { status: 200, headers: { ...CORS, "Content-Type": "application/json" } }
-    );
+    const body = {
+      id: b.id,
+      status: b.status,
+      created_at: b.created_at,
+      in_progress_at: b.in_progress_at || null,
+      completed_at: b.completed_at || null,
+      output_file_id: b.output_file_id || null,
+      error_file_id: b.error_file_id || null,
+      request_counts: b.request_counts || null,
+      errors: b.errors || null,
+    };
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { ...CORS, "Content-Type": "application/json" },
+    });
   } catch (e) {
     console.error("batch-status error:", e);
     return new Response(JSON.stringify({ error: e.message }), {
