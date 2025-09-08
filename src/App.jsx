@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 
+const API_BASE = "/.netlify/functions"; // call functions directly to avoid rewrite issues
+
 export default function App() {
   const [file, setFile] = useState(null);
   const [inputCol, setInputCol] = useState("text");
@@ -36,8 +38,8 @@ export default function App() {
     if (terminal.includes(status)) stopPolling();
   }, [status]);
 
-  const isGpt5    = model.startsWith("gpt-5");                 // gpt-5, gpt-5-mini, gpt-5-nano
-  const isOseries = /^o\d/i.test(model) || model.startsWith("o"); // o3, o4-mini, etc.
+  const isGpt5    = model.startsWith("gpt-5");
+  const isOseries = /^o\d/i.test(model) || model.startsWith("o");
 
   async function submitBatch(e) {
     e.preventDefault();
@@ -61,7 +63,8 @@ export default function App() {
 
       log(`Create Batch → model=${model}, inputCol=${inputCol}, K=${chunkSize}, reasoning=${reasoningEffort}${isGpt5 && verbosity ? `, verbosity=${verbosity}` : ""}`);
       const t0 = performance.now();
-      const r = await fetch("/api/batch-create", { method: "POST", body: fd });
+
+      const r = await fetch(`${API_BASE}/batch-create`, { method: "POST", body: fd });
 
       let bodyText = "";
       try { bodyText = await r.text(); } catch {}
@@ -70,15 +73,13 @@ export default function App() {
       log(`Response ${r.status} in ${dt}s`);
 
       if (!r.ok) {
-        let msg = bodyText;
-        try { msg = JSON.parse(bodyText).error || msg; } catch {}
+        let msg = bodyText; try { msg = JSON.parse(bodyText).error || msg; } catch {}
         setError(msg || `Create batch failed (HTTP ${r.status})`);
         log(`Error: ${msg || `HTTP ${r.status}`}`);
         return;
       }
 
-      let j = {};
-      try { j = JSON.parse(bodyText || "{}"); } catch {}
+      let j = {}; try { j = JSON.parse(bodyText || "{}"); } catch {}
       if (!j.batchId) { setError("No batchId returned from server."); log("Error: No batchId in response."); return; }
 
       setBatchId(j.batchId);
@@ -97,7 +98,7 @@ export default function App() {
   async function checkStatus() {
     if (!batchId) return;
     try {
-      const r = await fetch(`/api/batch-status?id=${encodeURIComponent(batchId)}`);
+      const r = await fetch(`${API_BASE}/batch-status?id=${encodeURIComponent(batchId)}`);
       const t = await r.text();
       if (!r.ok) {
         let msg = t; try { msg = JSON.parse(t).error || msg; } catch {}
@@ -119,7 +120,7 @@ export default function App() {
   function downloadOutput() {
     if (!batchId) return;
     log("Downloading merged CSV…");
-    window.location.href = `/api/batch-download?id=${encodeURIComponent(batchId)}`;
+    window.location.href = `${API_BASE}/batch-download?id=${encodeURIComponent(batchId)}`;
   }
 
   function clearLogs() { setLogs([]); }
@@ -210,10 +211,7 @@ export default function App() {
           <h2 style={{ margin: 0, fontSize: 18 }}>Console</h2>
           <div style={{ display: "flex", gap: 8 }}>
             <button type="button" onClick={clearLogs}>Clear</button>
-            <button type="button" onClick={async () => {
-              try { await navigator.clipboard.writeText(logs.join("\n")); log("Logs copied to clipboard."); }
-              catch { log("Copy failed (clipboard permissions)."); }
-            }}>Copy</button>
+            <button type="button" onClick={copyLogs}>Copy</button>
           </div>
         </div>
         <pre ref={logRef} style={{
