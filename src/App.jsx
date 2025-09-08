@@ -10,6 +10,8 @@ export default function App() {
   const [status, setStatus] = useState('');
   const [outputReady, setOutputReady] = useState(false);
   const [error, setError] = useState('');
+  const [reasoningEffort, setReasoningEffort] = useState('medium'); // minimal|low|medium|high
+  const [verbosity, setVerbosity] = useState(''); // "", "low", "medium", "high" (GPT-5 only, optional)
 
   async function submitBatch(e) {
     e.preventDefault();
@@ -24,6 +26,8 @@ export default function App() {
     formData.append('prompt', prompt);
     formData.append('model', model);
     formData.append('chunkSize', String(chunkSize)); // NEW
+    formData.append('reasoning_effort', reasoningEffort);
+formData.append('verbosity', verbosity); // optional
 
     const r = await fetch('/api/batch-create', { method: 'POST', body: formData });
     const j = await r.json();
@@ -72,6 +76,23 @@ export default function App() {
     <option>gpt-4.1-mini</option>
     <option>gpt-4o-mini</option>
     <option>gpt-4.1</option>
+  </select>
+</label>
+<label>Reasoning effort (GPT-5 & o-series)
+  <select value={reasoningEffort} onChange={e => setReasoningEffort(e.target.value)}>
+    <option>minimal</option>
+    <option>low</option>
+    <option>medium</option>
+    <option>high</option>
+  </select>
+</label>
+
+<label>Verbosity (GPT-5 only, optional)
+  <select value={verbosity} onChange={e => setVerbosity(e.target.value)}>
+    <option value="">(default)</option>
+    <option>low</option>
+    <option>medium</option>
+    <option>high</option>
   </select>
 </label>
 
