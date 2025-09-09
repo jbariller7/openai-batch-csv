@@ -28,6 +28,9 @@ exports.handler = async (event) => {
   const url = urlStr ? new URL(urlStr) : null;
   const id = url?.searchParams.get("id") || event?.queryStringParameters?.id || "";
   if (!id) return res(400, { error: "Missing id" });
+  const urlStr = typeof reqOrEvent?.rawUrl === "string" ? reqOrEvent.rawUrl : "";
+const url = urlStr ? new URL(urlStr) : null;
+const wantPartial = (url?.searchParams.get("partial") === "1");
 
   const { getStore } = await import("@netlify/blobs");
   const { default: OpenAI } = await import("openai");
@@ -40,15 +43,91 @@ const store  = (siteID && token)
   ? getStore({ name: "openai-batch-csv", siteID, token })
   : getStore("openai-batch-csv");
 
-    // DIRECT path (CSV already stored)
-    let directCsvText = null;
-    try { directCsvText = await store.get(`results/${id}.csv`, { type: "text" }); } catch {}
-    if (typeof directCsvText === "string") {
-      return res(200, directCsvText, {
-        "Content-Type": "text/csv; charset=utf-8",
-        "Content-Disposition": `attachment; filename="${id}.csv"`,
-      });
+// Direct-mode full CSV present?
+let directCsvText = null;
+try { directCsvText = await store.get(`results/${id}.csv`, { type: "text" }); } catch {}
+if (typeof directCsvText === "string" && !wantPartial) {
+  return new Response(directCsvText, {
+    status: 200,
+    headers: {
+      ...CORS,
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${id}.csv"`,
+    },
+  });
+}
+
+// NEW: Partial download path for Direct jobs
+if (wantPartial) {
+  // Is this a Direct job? (Direct jobs have no batchId in their meta)
+  const meta = await store.get(`jobs/${id}.json`, { type: "json" }).catch(() => null);
+  if (meta && !meta.batchId) {
+    // Read original CSV rows
+    const csvTxt = await store.get(`csv/${id}.csv`, { type: "text" }).catch(() => null);
+    if (!csvTxt) {
+      return new Response(JSON.stringify({ error: "Original CSV not found" }), { status: 404, headers: CORS });
     }
+    const rows = await new Promise((resolve, reject) => {
+      const out = [];
+      csvParse(csvTxt, { columns: true, relax_quotes: true })
+        .on("data", (r) => out.push(r))
+        .on("end", () => resolve(out))
+        .on("error", reject);
+    });
+
+    // Figure out how many chunks to look for
+    let totalChunks = 0;
+    try {
+      const st = await store.get(`jobs/${id}.status.json`, { type: "json" });
+      totalChunks = Number(st?.totalChunks || 0);
+    } catch {}
+    if (!totalChunks) {
+      // fall back to meta if needed
+      const K = Number(meta?.chunkSize || 200);
+      totalChunks = Math.ceil(rows.length / K);
+    }
+
+    // Merge partials into a copy of rows
+    const merged = rows.map((r) => ({ ...r, result: "" }));
+    for (let i = 0; i < totalChunks; i++) {
+      let part = null;
+      try { part = await store.get(`partials/${id}/${i}.json`, { type: "json" }); } catch {}
+      if (!part) continue;
+
+      const arr = Array.isArray(part?.results) ? part.results
+               : (Array.isArray(part) ? part
+               : null);
+      if (!arr) continue;
+
+      for (const item of arr) {
+        const idx = Number(item?.id);
+        if (Number.isFinite(idx) && idx >= 0 && idx < merged.length) {
+          merged[idx].result =
+            typeof item?.result === "string"
+              ? item.result
+              : (item?.result != null ? String(item.result) : "");
+        }
+      }
+    }
+
+    // Serialize partial CSV
+    const headers = Object.keys(merged[0] || {});
+    const csvStr = await new Promise((resolve, reject) => {
+      csvStringify(merged, { header: true, columns: headers }, (err, out) => err ? reject(err) : resolve(out));
+    });
+
+    return new Response(csvStr, {
+      status: 200,
+      headers: {
+        ...CORS,
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="${id}.partial.csv"`,
+        "X-Partial": "1",
+      },
+    });
+  }
+}
+
 
     // BATCH path
     const b = await client.batches.retrieve(id);
