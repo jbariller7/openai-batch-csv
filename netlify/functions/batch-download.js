@@ -1,11 +1,9 @@
-import OpenAI from "openai";
-import { getStore } from "@netlify/blobs";
-import { parse as csvParse } from "csv-parse";
-import { stringify as csvStringify } from "csv-stringify";
+// netlify/functions/batch-download.js  (CommonJS)
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const { parse: csvParse } = require("csv-parse");
+const { stringify: csvStringify } = require("csv-stringify");
 
-export const config = { /* path: "/api/batch-download" */ };
+exports.config = { /* path: "/api/batch-download" */ };
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -22,7 +20,7 @@ function getUrl(req) {
   return typeof req.url === "string" ? req.url : (req.rawUrl || "");
 }
 
-export default async (reqOrEvent) => {
+exports.handler = async (reqOrEvent) => {
   const method = getMethod(reqOrEvent);
   if (method === "OPTIONS" || method === "HEAD") {
     return new Response("", { status: 204, headers: CORS });
@@ -37,29 +35,29 @@ export default async (reqOrEvent) => {
     });
   }
 
+  // ESM deps
+  const { getStore } = await import("@netlify/blobs");
+  const { default: OpenAI } = await import("openai");
+  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
   try {
     const store = getStore("openai-batch-csv");
 
-// ----- NEW: direct-mode download path -----
-let directCsvText = null;
-try {
-  directCsvText = await store.get(`results/${id}.csv`, { type: "text" });
-} catch (_) {
-  directCsvText = null;
-}
-if (typeof directCsvText === "string") {
-  return new Response(directCsvText, {
-    status: 200,
-    headers: {
-      ...CORS,
-      "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="${id}.csv"`,
-    },
-  });
-}
+    // Direct-mode CSV path
+    let directCsvText = null;
+    try { directCsvText = await store.get(`results/${id}.csv`, { type: "text" }); } catch {}
+    if (typeof directCsvText === "string") {
+      return new Response(directCsvText, {
+        status: 200,
+        headers: {
+          ...CORS,
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${id}.csv"`,
+        },
+      });
+    }
 
-
-    // ----- Existing batch download path -----
+    // Batch path
     const b = await client.batches.retrieve(id);
     if (b.status !== "completed") {
       return new Response(
@@ -74,7 +72,7 @@ if (typeof directCsvText === "string") {
       });
     }
 
-    const meta = await store.get(`jobs/${id}.json`, { type: "json" });
+    const meta = await store.get(`jobs/${id}.json`, { type: "json" }).catch(() => null);
     if (!meta) {
       return new Response(JSON.stringify({ error: "Job metadata not found" }), {
         status: 404,
@@ -83,7 +81,7 @@ if (typeof directCsvText === "string") {
     }
 
     // Read original CSV rows
-    const csvTxt = await store.get(`csv/${meta.jobId}.csv`, { type: "text" });
+    const csvTxt = await store.get(`csv/${meta.jobId}.csv`, { type: "text" }).catch(() => null);
     if (!csvTxt) {
       return new Response(JSON.stringify({ error: "Original CSV not found" }), {
         status: 404,
@@ -166,7 +164,7 @@ if (typeof directCsvText === "string") {
       status: 200,
       headers: {
         ...CORS,
-        "Content-Type": "text/csv",
+        "Content-Type": "text/csv; charset=utf-8",
         "Content-Disposition": `attachment; filename="${id}.csv"`,
       },
     });
