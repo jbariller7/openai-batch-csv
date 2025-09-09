@@ -1,26 +1,30 @@
-// netlify/functions/direct-status.js  (CommonJS)
+// netlify/functions/direct-status.js  (CommonJS + Lambda-style returns)
 
 exports.config = { /* path: "/api/direct-status" */ };
 
-exports.handler = async function (req) {
-  const url = new URL(req.url);
-  const id = url.searchParams.get("id");
-  if (!id) {
-    return new Response(JSON.stringify({ error: "Missing id" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+function res(statusCode, bodyObj, extraHeaders) {
+  return {
+    statusCode,
+    headers: { "Content-Type": "application/json", ...(extraHeaders || {}) },
+    body: JSON.stringify(bodyObj ?? {}),
+  };
+}
+
+exports.handler = async function (event) {
+  const urlStr = typeof event?.url === "string" ? event.url : (event?.rawUrl || "");
+  const url = urlStr ? new URL(urlStr) : null;
+  const id = url?.searchParams.get("id") || (event?.queryStringParameters?.id || "");
+
+  if (!id) return res(400, { error: "Missing id" });
 
   const { getStore } = await import("@netlify/blobs");
   const store = getStore("openai-batch-csv");
 
   try {
     let statusJson = null;
-    try {
-      statusJson = await store.get(`jobs/${id}.status.json`, { type: "json" });
-    } catch {}
+    try { statusJson = await store.get(`jobs/${id}.status.json`, { type: "json" }); } catch {}
 
+    // If no explicit status yet, check for CSV presence
     let csvExists = false;
     if (!statusJson || statusJson.status !== "ready") {
       try {
@@ -33,14 +37,8 @@ exports.handler = async function (req) {
     const status = ready ? "ready" : (statusJson?.status || "running");
     const error = statusJson?.error || null;
 
-    return new Response(JSON.stringify({ id, ready, status, error }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
+    return res(200, { id, ready, status, error });
   } catch (e) {
-    return new Response(JSON.stringify({ error: e?.message || String(e) }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
+    return res(500, { error: e?.message || String(e) });
   }
 };
