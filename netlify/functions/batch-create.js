@@ -217,7 +217,9 @@ export default async function handler(reqOrEvent) {
 // 5) DIRECT: kick off a Background Function to do the work, return immediately
 if (direct) {
   // Persist metadata the worker needs
-  await store.setJSON(`jobs/${jobId}.json`, {
+await store.set(
+  `jobs/${jobId}.json`,
+  JSON.stringify({
     jobId,
     model,
     prompt,
@@ -226,7 +228,10 @@ if (direct) {
     reasoningEffort,
     concurrency,
     createdAt: new Date().toISOString(),
-  });
+  }),
+  { contentType: "application/json" }
+);
+
 
   // Invoke the background worker
   const baseUrl =
@@ -300,17 +305,7 @@ if (direct) {
     });
 
     // Persist job metadata
-    await store.setJSON(`jobs/${batch.id}.json`, {
-      jobId,
-      batchId: batch.id,
-      inputCol,
-      model,
-      prompt,
-      chunkSize,
-      reasoningEffort,
-      createdAt: new Date().toISOString(),
-      rowCount: effectiveRows.length,
-    });
+store.setJSON(`jobs/${batch.id}.json`, {
 
     return new Response(
       JSON.stringify({ mode: "batch", batchId: batch.id, jobId }),
