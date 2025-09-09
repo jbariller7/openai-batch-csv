@@ -4,11 +4,13 @@ import OpenAI, { toFile } from "openai";
 import { getStore } from "@netlify/blobs";
 import Busboy from "busboy";
 import { parse as csvParse } from "csv-parse";
+import { stringify as csvStringify } from "csv-stringify";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // Optional pretty path when invoking as /.netlify/functions/*
 export const config = { /* path: "/api/batch-create" */ };
+
 // Some models (gpt-5 family) don't support temperature
 const supportsTemperature = (name) => !/^gpt-5(\b|[-_])/.test(name);
 
@@ -164,11 +166,10 @@ export default async function handler(reqOrEvent) {
       /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
 
     const suffix =
-  ' You will receive a json object {"rows":[{"id":number,"text":string},...]}.'
-  + ' For each item, produce {"id": same id, "result": <string>} following the user instructions above.'
-  + ' The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]}'
-  + ' in the SAME ORDER as input. Do not include any commentary.';
-
+      ' You will receive a json object {"rows":[{"id":number,"text":string},...]}.'
+      + ' For each item, produce {"id": same id, "result": <string>} following the user instructions above.'
+      + ' The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]}'
+      + ' in the SAME ORDER as input. Do not include any commentary.';
 
     // 4) DRY RUN: run first chunk immediately with /v1/responses
     if (dryRun) {
@@ -177,19 +178,17 @@ export default async function handler(reqOrEvent) {
         text: String(r?.[inputCol] ?? ""),
       }));
 
-const body = {
-  model,
-  input: [
-    { role: "system", content: `${prompt}${suffix}` },
-    { role: "user", content: "Return only a json object as specified. The output must be valid json." },
-    { role: "user", content: JSON.stringify({ rows: firstChunk }) }
-  ],
-text: { format: { type: "json_object" } },
-...(supportsTemperature(model) ? { temperature: 0 } : {}),
-...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
-
-};
-
+      const body = {
+        model,
+        input: [
+          { role: "system", content: `${prompt}${suffix}` },
+          { role: "user", content: "Return only a json object as specified. The output must be valid json." },
+          { role: "user", content: JSON.stringify({ rows: firstChunk }) }
+        ],
+        text: { format: { type: "json_object" } },
+        ...(supportsTemperature(model) ? { temperature: 0 } : {}),
+        ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+      };
 
       const resp = await client.responses.create(body);
 
@@ -222,47 +221,74 @@ text: { format: { type: "json_object" } },
         chunks.push(items.slice(i, i + chunkSize));
       }
 
-function buildBody(rowsChunk) {
-  return {
-    model,
-    input: [
-      { role: "system", content: `${prompt}${suffix}` },
-      { role: "user", content: "Return only a json object as specified. The output must be valid json." },
-      { role: "user", content: JSON.stringify({ rows: rowsChunk }) }
-    ],
-text: { format: { type: "json_object" } },
-...(supportsTemperature(model) ? { temperature: 0 } : {}),
-...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
-
-  };
-}
-
+      function buildBody(rowsChunk) {
+        return {
+          model,
+          input: [
+            { role: "system", content: `${prompt}${suffix}` },
+            { role: "user", content: "Return only a json object as specified. The output must be valid json." },
+            { role: "user", content: JSON.stringify({ rows: rowsChunk }) }
+          ],
+          text: { format: { type: "json_object" } },
+          ...(supportsTemperature(model) ? { temperature: 0 } : {}),
+          ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+        };
+      }
 
       // simple concurrency pool
       let i = 0;
-      const results = new Array(chunks.length);
+      const parts = new Array(chunks.length);
       async function worker() {
         while (i < chunks.length) {
           const my = i++;
           const resp = await client.responses.create(buildBody(chunks[my]));
           let parsed = null;
           try { parsed = JSON.parse(resp.output_text || ""); } catch {}
-          results[my] = parsed;
+          parts[my] = parsed; // keep slot order
         }
       }
       await Promise.all(Array.from({ length: concurrency }, worker));
 
       // flatten {"results":[...]} blocks
-      const merged = [];
-      for (const part of results) if (part?.results) merged.push(...part.results);
+      const results = [];
+      for (const p of parts) if (p?.results) results.push(...p.results);
 
-      // store merged for inspection if you want
-      await store.setJSON(`results/${jobId}.json`, {
-        jobId, model, rowCount: effectiveRows.length, results: merged,
+      // ----- NEW: build merged CSV and store it -----
+      const mergedRows = effectiveRows.map((r) => ({ ...r, result: "" }));
+
+      for (const item of results) {
+        const idx = Number(item?.id);
+        if (Number.isFinite(idx) && idx >= 0 && idx < mergedRows.length) {
+          const val = typeof item?.result === "string"
+            ? item.result
+            : item?.result != null
+              ? String(item.result)
+              : "";
+          mergedRows[idx].result = val;
+        }
+      }
+
+      const headers = Object.keys(mergedRows[0] || {});
+      const csvStr = await new Promise((resolve, reject) => {
+        csvStringify(mergedRows, { header: true, columns: headers }, (err, out) => {
+          if (err) reject(err);
+          else resolve(out);
+        });
       });
 
+      await store.set(`results/${jobId}.csv`, csvStr);
+
       return new Response(
-        JSON.stringify({ mode: "direct", jobId, model, rowCount: effectiveRows.length, results: merged }),
+        JSON.stringify({
+          mode: "direct",
+          jobId,
+          model,
+          rowCount: effectiveRows.length,
+          // still include results for preview, if your UI wants it
+          results,
+          // handy link your UI can use immediately
+          download: `/.netlify/functions/batch-download?id=${jobId}`,
+        }),
         { status: 200, headers: { ...CORS, "Content-Type": "application/json" } }
       );
     }
@@ -275,19 +301,17 @@ text: { format: { type: "json_object" } },
         text: String(r?.[inputCol] ?? ""),
       }));
 
-const body = {
-  model,
-  input: [
-    { role: "system", content: `${prompt}${suffix}` },
-    { role: "user", content: "Return only a json object as specified. The output must be valid json." },
-    { role: "user", content: JSON.stringify({ rows: chunk }) }
-  ],
-text: { format: { type: "json_object" } },
-...(supportsTemperature(model) ? { temperature: 0 } : {}),
-...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
-
-};
-
+      const body = {
+        model,
+        input: [
+          { role: "system", content: `${prompt}${suffix}` },
+          { role: "user", content: "Return only a json object as specified. The output must be valid json." },
+          { role: "user", content: JSON.stringify({ rows: chunk }) }
+        ],
+        text: { format: { type: "json_object" } },
+        ...(supportsTemperature(model) ? { temperature: 0 } : {}),
+        ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+      };
 
       lines.push(
         JSON.stringify({
