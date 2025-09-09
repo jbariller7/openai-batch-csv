@@ -7,6 +7,8 @@ import { parse as csvParse } from "csv-parse";
 import { stringify as csvStringify } from "csv-stringify";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Max parallel calls for Direct mode; override in Netlify env with MAX_DIRECT_CONCURRENCY
+const MAX_DIRECT_CONCURRENCY = Number(process.env.MAX_DIRECT_CONCURRENCY || 8);
 
 // Optional pretty path when invoking as /.netlify/functions/*
 export const config = { /* path: "/api/batch-create" */ };
