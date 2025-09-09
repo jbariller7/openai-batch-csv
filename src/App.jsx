@@ -44,6 +44,31 @@ export default function App() {
     const terminal = ["completed", "failed", "cancelled", "expired"];
     if (terminal.includes(status)) stopPolling();
   }, [status]);
+  async function checkDirectStatus(idParam) {
+  const id = idParam || batchId;
+  if (!id) return;
+  try {
+    const r = await fetch(`${API_BASE}/direct-status?id=${encodeURIComponent(id)}`);
+    const t = await r.text();
+    let j = {}; try { j = JSON.parse(t); } catch {}
+    if (j.ready) {
+      setStatus("ready");
+      setOutputReady(true);
+      log("Direct job finished. CSV is ready to download.");
+      stopPolling();
+    } else {
+      setStatus(j.status || "running");
+      log(`Direct job status: ${j.status || "running"}`);
+    }
+  } catch (err) {
+    log(`Direct status error: ${err?.message || String(err)}`);
+  }
+}
+
+function startPollingDirect(id) {
+  stopPolling();
+  pollRef.current = setInterval(() => checkDirectStatus(id), 3000);
+}
 
   const isGpt5    = model.startsWith("gpt-5");
   const isOseries = /^o\d/i.test(model) || model.startsWith("o");
@@ -114,17 +139,19 @@ export default function App() {
         return;
       }
 
-      // Handle DIRECT (CSV ready now)
-      if (returnedMode === "direct") {
-        const id = j.jobId || "";
-        setBatchId(id);                   // <- show the panel & reuse download button
-        setStatus("ready");
-        setOutputReady(true);             // <- enable the button
-        setPreview(j.results || null);    // optional preview if you want it elsewhere
-        setDownloadUrl(j.download || `${API_BASE}/batch-download?id=${encodeURIComponent(id)}`);
-        log(`Direct run OK. Processed rows: ${j.rowCount ?? "?"}. CSV is ready to download.`);
-        return;
-      }
+// Handle DIRECT (CSV will be built by the background worker)
+if (returnedMode === "direct") {
+  const id = j.jobId || "";
+  setBatchId(id);                   // show the panel & reuse the download button
+  setStatus("running");
+  setOutputReady(false);
+  setPreview(null);
+  setDownloadUrl(j.download || `${API_BASE}/batch-download?id=${encodeURIComponent(id)}`);
+  log(`Direct job started. Processing in the background… Polling for readiness.`);
+  startPollingDirect(id);           // start polling direct status
+  return;
+}
+
 
       // Batch path (default)
       if (!j.batchId) { setError("No batchId returned from server."); log("Error: No batchId in response."); return; }
@@ -282,20 +309,32 @@ export default function App() {
       </form>
 
       {/* Job panel (works for Batch AND Direct) */}
-      {batchId && (
-        <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
-          <div><strong>Job ID:</strong> {batchId}</div>
-          <div><strong>Status:</strong> {status || "(unknown)"} </div>
-          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-            {lastRunMode === "batch" && <button onClick={checkStatus}>Refresh Status</button>}
-            <button onClick={downloadOutput} disabled={!outputReady}>Download merged CSV</button>
-            {lastRunMode === "direct" && downloadUrl && (
-              <a href={downloadUrl} style={{ alignSelf: "center" }}>Open link</a>
-            )}
-          </div>
-          {error && <p style={{ color: "crimson", marginTop: 8 }}>{error}</p>}
-        </div>
+{batchId && (
+  <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
+    <div><strong>Job ID:</strong> {batchId}</div>
+    <div><strong>Status:</strong> {status || (lastRunMode === "direct" ? "running" : "(unknown)")} </div>
+
+    {lastRunMode === "direct" && !outputReady && (
+      <div style={{ marginTop: 6, fontSize: 13, opacity: 0.8 }}>
+        Building CSV in the background… you can refresh the status or leave this tab.
+      </div>
+    )}
+
+    <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+      {lastRunMode === "batch"  && <button onClick={checkStatus}>Refresh Status</button>}
+      {lastRunMode === "direct" && <button onClick={() => checkDirectStatus()}>Refresh Status</button>}
+
+      <button onClick={downloadOutput} disabled={!outputReady}>Download merged CSV</button>
+
+      {lastRunMode === "direct" && downloadUrl && (
+        <a href={downloadUrl} style={{ alignSelf: "center" }}>Open link</a>
       )}
+    </div>
+
+    {error && <p style={{ color: "crimson", marginTop: 8 }}>{error}</p>}
+  </div>
+)}
+
 
       {/* Dry preview panel */}
       {!batchId && preview && lastRunMode === "dry" && (
