@@ -188,7 +188,8 @@ if (direct) {
   );
 
   // ---- BUILD ORIGIN FROM INCOMING REQUEST HEADERS (works in prod & netlify dev)
-  const hdrs = reqOrEvent.headers || {};
+  const hdrs = event.headers || {};
+
   const host =
     hdrs["x-forwarded-host"] ||
     hdrs["host"] ||
