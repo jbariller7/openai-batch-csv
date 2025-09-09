@@ -50,6 +50,12 @@ export default function App() {
     stopPolling();
     pollRef.current = setInterval(() => checkDirectStatus(id), 3000);
   }
+  function downloadPartial() {
+  if (!batchId) return;
+  log("Downloading partial CSV…");
+  const url = `${API_BASE}/batch-download?id=${encodeURIComponent(batchId)}&partial=1`;
+  window.location.href = url;
+}
 
   useEffect(() => {
     // stop on terminal statuses (Batch) + "ready" (Direct)
@@ -427,6 +433,20 @@ export default function App() {
               </a>
             )}
           </div>
+           <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+  {lastRunMode === "batch"  && <button onClick={checkStatus}>Refresh Status</button>}
+  {lastRunMode === "direct" && <button onClick={() => checkDirectStatus()}>Refresh Status</button>}
+
+  <button onClick={downloadOutput} disabled={!outputReady}>Download merged CSV</button>
+
+  {lastRunMode === "direct" && !outputReady && (
+    <button onClick={downloadPartial}>Download partial CSV</button>
+  )}
+
+  {lastRunMode === "direct" && downloadUrl && (
+    <a href={downloadUrl} style={{ alignSelf: "center" }}>Open link</a>
+  )}
+</div>
 
           {error && <p style={{ color: "crimson", marginTop: 8 }}>{error}</p>}
         </div>
