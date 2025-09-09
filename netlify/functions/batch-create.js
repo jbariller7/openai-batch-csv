@@ -224,6 +224,22 @@ export default async function handler(reqOrEvent) {
       for (let i = 0; i < items.length; i += chunkSize) {
         chunks.push(items.slice(i, i + chunkSize));
       }
+      async function callWithRetry(fn, { retries = 5, base = 300, max = 5000 } = {}) {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fn();
+    } catch (err) {
+      const status = err?.status || err?.statusCode || err?.response?.status;
+      // Retry on 429/rate-limit and transient 5xx; fail fast on other 4xx
+      const retriable = status === 429 || (status >= 500 && status < 600) || !status;
+      if (attempt >= retries || !retriable) throw err;
+      const delay = Math.min(max, base * Math.pow(2, attempt)) * (0.5 + Math.random()); // jitter
+      await new Promise(r => setTimeout(r, delay));
+      attempt++;
+    }
+  }
+}
 
       function buildBody(rowsChunk) {
         return {
@@ -245,7 +261,8 @@ export default async function handler(reqOrEvent) {
       async function worker() {
         while (i < chunks.length) {
           const my = i++;
-          const resp = await client.responses.create(buildBody(chunks[my]));
+          const resp = await callWithRetry(() => client.responses.create(buildBody(chunks[my])));
+
           let parsed = null;
           try { parsed = JSON.parse(resp.output_text || ""); } catch {}
           parts[my] = parsed; // keep slot order
