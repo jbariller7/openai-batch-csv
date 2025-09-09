@@ -17,7 +17,13 @@ export default async function handler(req) {
     const store = getStore("openai-batch-csv");
 
     // Prefer explicit status if present
-    const statusJson = await store.getJSON(`jobs/${id}.status.json`).catch(() => null);
+   let statusJson = null;
+try {
+  statusJson = await store.get(`jobs/${id}.status.json`, { type: "json" });
+} catch (_) {
+  statusJson = null;
+}
+
 
     // If no status JSON yet, consider CSV existence as readiness
     let csvExists = false;
