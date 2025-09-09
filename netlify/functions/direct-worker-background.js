@@ -161,11 +161,12 @@ exports.handler = async function (event) {
       while (i < totalChunks) {
         const my = i++;
         const label = `chunk#${my + 1}`;
-        const resp = await callWithRetry(() => client.responses.create(buildBody(chunks[my])), { label });
-        let parsed = null; try { parsed = JSON.parse(resp.output_text || ""); } catch {}
-        parts[my] = parsed;
-        completedChunks++;
-        const processedRows = Math.min(completedChunks * chunkSize, items.length);
+const resp = await callWithRetry(() => client.responses.create(buildBody(chunks[my])), { label });
+let parsed = null; try { parsed = JSON.parse(resp.output_text || ""); } catch {}
+parts[my] = parsed;
+completedChunks++;
+const processedRows = Math.min(completedChunks * chunkSize, items.length);
+
         // update every chunk (small jobs) or every 3 (bigger)
         if (totalChunks <= 50 || completedChunks % 3 === 0 || completedChunks === totalChunks) {
           await writeStatus("running",
