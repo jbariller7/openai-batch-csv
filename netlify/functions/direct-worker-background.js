@@ -1,13 +1,12 @@
-// netlify/functions/direct-worker-background.js  (CommonJS + dynamic import for ESM deps)
+// netlify/functions/direct-worker-background.js  (CommonJS + dynamic import)
 
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
 
-// limits/compat
+exports.config = { /* path: "/api/direct-worker-background" */ };
+
 const MAX_DIRECT_CONCURRENCY = Number(process.env.MAX_DIRECT_CONCURRENCY || 8);
 const supportsTemperature = (name) => !/^gpt-5(\b|[-_])/.test(name);
-
-exports.config = { /* path: "/api/direct-worker-background" */ };
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -19,29 +18,19 @@ function json(body, status = 200) {
 exports.handler = async function (req) {
   if (req.method !== "POST") return json({ error: "POST only" }, 405);
 
-  // Dynamically import ESM modules inside the handler
+  // ESM deps
   const { getStore } = await import("@netlify/blobs");
   const { default: OpenAI } = await import("openai");
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-  let jobId = "";
   const store = getStore("openai-batch-csv");
 
-  // helper to persist status in Blobs (CJS-friendly)
+  let jobId = "";
+
   async function writeStatus(status, extra = {}) {
     if (!jobId) return;
-    const payload = {
-      jobId,
-      status, // "queued" | "running" | "ready" | "failed"
-      updatedAt: new Date().toISOString(),
-      ...extra,
-    };
+    const payload = { jobId, status, updatedAt: new Date().toISOString(), ...extra };
     try {
-      await store.set(
-        `jobs/${jobId}.status.json`,
-        JSON.stringify(payload),
-        { contentType: "application/json" }
-      );
+      await store.set(`jobs/${jobId}.status.json`, JSON.stringify(payload), { contentType: "application/json" });
     } catch {}
   }
 
@@ -52,26 +41,15 @@ exports.handler = async function (req) {
 
     await writeStatus("running");
 
-    // Read metadata (saved by batch-create.js)
     const meta = await store.get(`jobs/${jobId}.json`, { type: "json" }).catch(() => null);
     if (!meta) {
       await writeStatus("failed", { error: "Job metadata not found" });
       return json({ error: "Job metadata not found" }, 404);
     }
 
-    const {
-      model,
-      prompt,
-      inputCol = "text",
-      chunkSize = 200,
-      reasoningEffort = "",
-      concurrency: desiredConcurrency = 4,
-    } = meta;
+    const { model, prompt, inputCol = "text", chunkSize = 200, reasoningEffort = "", concurrency: desiredConcurrency = 4 } = meta;
+    const supportsReasoning = /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
 
-    const supportsReasoning =
-      /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
-
-    // Read original CSV (as text for Blobs compatibility)
     const csvTxt = await store.get(`csv/${jobId}.csv`, { type: "text" }).catch(() => null);
     if (!csvTxt) {
       await writeStatus("failed", { error: "Original CSV not found" });
@@ -109,17 +87,15 @@ exports.handler = async function (req) {
       return body;
     }
 
-    // Chunk
+    // chunk
     const chunks = [];
     for (let i = 0; i < items.length; i += chunkSize) chunks.push(items.slice(i, i + chunkSize));
 
-    // Retry helper for rate limits/transient errors
     async function callWithRetry(fn, { retries = 5, base = 300, max = 5000 } = {}) {
       let attempt = 0;
       for (;;) {
-        try {
-          return await fn();
-        } catch (err) {
+        try { return await fn(); }
+        catch (err) {
           const status = err?.status || err?.statusCode || err?.response?.status;
           const retriable = status === 429 || (status >= 500 && status < 600) || !status;
           if (attempt >= retries || !retriable) throw err;
@@ -153,9 +129,8 @@ exports.handler = async function (req) {
         const idx = Number(item?.id);
         if (Number.isFinite(idx) && idx >= 0 && idx < mergedRows.length) {
           mergedRows[idx].result =
-            typeof item?.result === "string"
-              ? item.result
-              : (item?.result != null ? String(item.result) : "");
+            typeof item?.result === "string" ? item.result :
+            (item?.result != null ? String(item.result) : "");
         }
       }
     }
@@ -176,7 +151,7 @@ exports.handler = async function (req) {
   } catch (err) {
     console.error("direct-worker-background error:", err);
     try {
-      await store.set(
+      await (await import("@netlify/blobs")).getStore("openai-batch-csv").set(
         `jobs/${jobId}.status.json`,
         JSON.stringify({
           jobId,
