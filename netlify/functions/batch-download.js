@@ -38,6 +38,22 @@ export default async (reqOrEvent) => {
   }
 
   try {
+    const store = getStore("openai-batch-csv");
+
+    // ----- NEW: direct-mode download path -----
+    const directCsvBuf = await store.get(`results/${id}.csv`, { type: "buffer" });
+    if (directCsvBuf) {
+      return new Response(directCsvBuf, {
+        status: 200,
+        headers: {
+          ...CORS,
+          "Content-Type": "text/csv",
+          "Content-Disposition": `attachment; filename="${id}.csv"`,
+        },
+      });
+    }
+
+    // ----- Existing batch download path -----
     const b = await client.batches.retrieve(id);
     if (b.status !== "completed") {
       return new Response(
@@ -52,7 +68,6 @@ export default async (reqOrEvent) => {
       });
     }
 
-    const store = getStore("openai-batch-csv");
     const meta = await store.getJSON(`jobs/${id}.json`);
     if (!meta) {
       return new Response(JSON.stringify({ error: "Job metadata not found" }), {
