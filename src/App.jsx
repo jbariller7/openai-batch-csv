@@ -44,6 +44,7 @@ export default function App() {
     const terminal = ["completed", "failed", "cancelled", "expired"];
     if (terminal.includes(status)) stopPolling();
   }, [status]);
+
   async function checkDirectStatus(idParam) {
   const id = idParam || batchId;
   if (!id) return;
@@ -56,6 +57,12 @@ export default function App() {
       setOutputReady(true);
       log("Direct job finished. CSV is ready to download.");
       stopPolling();
+    } else if (j.status === "failed" || j.error) {
+      setStatus("failed");
+      setOutputReady(false);
+      setError(j.error || "Direct job failed.");
+      log(`Direct job failed: ${j.error || "(unknown error)"}`);
+      stopPolling();
     } else {
       setStatus(j.status || "running");
       log(`Direct job status: ${j.status || "running"}`);
@@ -64,6 +71,7 @@ export default function App() {
     log(`Direct status error: ${err?.message || String(err)}`);
   }
 }
+
 
 function startPollingDirect(id) {
   stopPolling();
