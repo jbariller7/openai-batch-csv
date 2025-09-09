@@ -14,7 +14,11 @@ exports.handler = async function (event) {
   if (!id) return res(400, { error: "Missing id" });
 
   const { getStore } = await import("@netlify/blobs");
-  const store = getStore("openai-batch-csv");
+  const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
+const token  = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
+const store  = (siteID && token)
+  ? getStore({ name: "openai-batch-csv", siteID, token })
+  : getStore("openai-batch-csv");
 
   try {
     let statusJson = null;
