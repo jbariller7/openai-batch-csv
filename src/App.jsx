@@ -260,16 +260,17 @@ export default function App() {
             </label>
 
             <label>Concurrency
-              <input
-                type="number"
-                min={1}
-                max={8}
-                value={concurrency}
-                onChange={(e) => setConcurrency(Number(e.target.value || 1))}
-                style={{ width: 90, marginLeft: 8 }}
-                disabled={mode !== "direct"}
-                title="Parallel /v1/responses calls (Direct mode only)"
-              />
+<input
+  type="number"
+  min={1}
+  // max={32} // optional: set a higher visible ceiling
+  value={concurrency}
+  onChange={(e) => setConcurrency(Number(e.target.value || 1))}
+  style={{ width: 90, marginLeft: 8 }}
+  disabled={mode !== "direct"}
+  title="Parallel /v1/responses calls (Direct mode only)"
+/>
+
             </label>
           </div>
         </div>
