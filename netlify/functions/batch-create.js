@@ -214,107 +214,45 @@ export default async function handler(reqOrEvent) {
       );
     }
 
-    // 5) DIRECT: process the whole CSV now with parallel /v1/responses
-    if (direct) {
-      const items = effectiveRows.map((r, idx) => ({
-        id: idx,
-        text: String(r?.[inputCol] ?? ""),
-      }));
+// 5) DIRECT: kick off a Background Function to do the work, return immediately
+if (direct) {
+  // Persist metadata the worker needs
+  await store.setJSON(`jobs/${jobId}.json`, {
+    jobId,
+    model,
+    prompt,
+    inputCol,
+    chunkSize,
+    reasoningEffort,
+    concurrency,
+    createdAt: new Date().toISOString(),
+  });
 
-      // chunk
-      const chunks = [];
-      for (let i = 0; i < items.length; i += chunkSize) {
-        chunks.push(items.slice(i, i + chunkSize));
-      }
-      async function callWithRetry(fn, { retries = 5, base = 300, max = 5000 } = {}) {
-  let attempt = 0;
-  for (;;) {
-    try {
-      return await fn();
-    } catch (err) {
-      const status = err?.status || err?.statusCode || err?.response?.status;
-      // Retry on 429/rate-limit and transient 5xx; fail fast on other 4xx
-      const retriable = status === 429 || (status >= 500 && status < 600) || !status;
-      if (attempt >= retries || !retriable) throw err;
-      const delay = Math.min(max, base * Math.pow(2, attempt)) * (0.5 + Math.random()); // jitter
-      await new Promise(r => setTimeout(r, delay));
-      attempt++;
-    }
-  }
+  // Invoke the background worker
+  const baseUrl =
+    process.env.URL ||
+    process.env.DEPLOY_URL ||
+    process.env.DEPLOY_PRIME_URL ||
+    "http://localhost:8888";
+  // Fire-and-forget; we don't await the whole processing (the function returns 202 quickly)
+  await fetch(`${baseUrl}/.netlify/functions/direct-worker-background`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jobId }),
+  }).catch(() => { /* ignore network hiccups; worker may still run */ });
+
+  return new Response(
+    JSON.stringify({
+      mode: "direct",
+      jobId,
+      model,
+      rowCount: effectiveRows.length,
+      download: `/.netlify/functions/batch-download?id=${jobId}`,
+    }),
+    { status: 202, headers: { ...CORS, "Content-Type": "application/json" } }
+  );
 }
 
-      function buildBody(rowsChunk) {
-        return {
-          model,
-          input: [
-            { role: "system", content: `${prompt}${suffix}` },
-            { role: "user", content: "Return only a json object as specified. The output must be valid json." },
-            { role: "user", content: JSON.stringify({ rows: rowsChunk }) }
-          ],
-          text: { format: { type: "json_object" } },
-          ...(supportsTemperature(model) ? { temperature: 0 } : {}),
-          ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
-        };
-      }
-
-      // simple concurrency pool
-      let i = 0;
-      const parts = new Array(chunks.length);
-      async function worker() {
-        while (i < chunks.length) {
-          const my = i++;
-          const resp = await callWithRetry(() => client.responses.create(buildBody(chunks[my])));
-
-          let parsed = null;
-          try { parsed = JSON.parse(resp.output_text || ""); } catch {}
-          parts[my] = parsed; // keep slot order
-        }
-      }
-      await Promise.all(Array.from({ length: concurrency }, worker));
-
-      // flatten {"results":[...]} blocks
-      const results = [];
-      for (const p of parts) if (p?.results) results.push(...p.results);
-
-      // ----- NEW: build merged CSV and store it -----
-      const mergedRows = effectiveRows.map((r) => ({ ...r, result: "" }));
-
-      for (const item of results) {
-        const idx = Number(item?.id);
-        if (Number.isFinite(idx) && idx >= 0 && idx < mergedRows.length) {
-          const val = typeof item?.result === "string"
-            ? item.result
-            : item?.result != null
-              ? String(item.result)
-              : "";
-          mergedRows[idx].result = val;
-        }
-      }
-
-      const headers = Object.keys(mergedRows[0] || {});
-      const csvStr = await new Promise((resolve, reject) => {
-        csvStringify(mergedRows, { header: true, columns: headers }, (err, out) => {
-          if (err) reject(err);
-          else resolve(out);
-        });
-      });
-
-      await store.set(`results/${jobId}.csv`, csvStr, { contentType: "text/csv; charset=utf-8" });
-
-      return new Response(
-        JSON.stringify({
-          mode: "direct",
-          jobId,
-          model,
-          rowCount: effectiveRows.length,
-          // still include results for preview, if your UI wants it
-          results,
-          // handy link your UI can use immediately
-          download: `/.netlify/functions/batch-download?id=${jobId}`,
-        }),
-        { status: 200, headers: { ...CORS, "Content-Type": "application/json" } }
-      );
-    }
 
     // 6) BATCH: build JSONL lines and enqueue
     const lines = [];
