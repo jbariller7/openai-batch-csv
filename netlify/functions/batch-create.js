@@ -126,7 +126,11 @@ export default async function handler(reqOrEvent) {
     const maxRows = Number(fields.maxRows || query.maxRows || 0) || 0;
     const dryRun = String(fields.dryRun || query.dryRun || "") === "1";
     const direct = String(fields.direct || query.direct || "") === "1";
-    const concurrency = Math.max(1, Math.min(8, Number(fields.concurrency || query.concurrency || 4)));
+    const concurrency = Math.max(
+  1,
+  Math.min(MAX_DIRECT_CONCURRENCY, Number(fields.concurrency || query.concurrency || 4))
+);
+
 
     if (!fileBuffer) {
       return new Response(JSON.stringify({ error: "CSV file is required" }), {
