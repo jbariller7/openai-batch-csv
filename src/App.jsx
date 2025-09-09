@@ -38,75 +38,42 @@ export default function App() {
   }, [logs]);
 
   const pollRef = useRef(null);
-  function startPolling() { stopPolling(); pollRef.current = setInterval(checkStatus, 3000); }
-  function stopPolling() { if (pollRef.current) clearInterval(pollRef.current); pollRef.current = null; }
+  function stopPolling() {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = null;
+  }
+  function startPolling() {
+    stopPolling();
+    pollRef.current = setInterval(checkStatus, 3000);
+  }
+  function startPollingDirect(id) {
+    stopPolling();
+    pollRef.current = setInterval(() => checkDirectStatus(id), 3000);
+  }
+
   useEffect(() => {
-    const terminal = ["completed", "failed", "cancelled", "expired"];
+    // stop on terminal statuses (Batch) + "ready" (Direct)
+    const terminal = ["completed", "failed", "cancelled", "expired", "ready"];
     if (terminal.includes(status)) stopPolling();
   }, [status]);
 
- // Put these below your other helpers (e.g., after checkStatus)
-async function checkDirectStatus(idParam) {
-  const id = idParam || batchId;
-  if (!id) return;
-  try {
-    const r = await fetch(`${API_BASE}/direct-status?id=${encodeURIComponent(id)}`);
-    const t = await r.text();
-    let j = {}; try { j = JSON.parse(t); } catch {}
-
-    if (j.error) {
-      setStatus("failed");
-      setOutputReady(false);
-      setError(j.error);
-      log(`Direct job failed: ${j.error}`);
-      stopPolling();
-      return;
-    }
-
-    // progress logs (optional but helpful)
-    if (j.totalChunks) {
-      log(`Progress: ${j.completedChunks}/${j.totalChunks} chunks, ${j.processedRows ?? "?"} rows processed`);
-    }
-    if (Array.isArray(j.events) && j.events.length) {
-      const last = j.events[j.events.length - 1];
-      if (last?.ts && last?.msg) log(`bg: ${last.msg}`);
-    }
-
-    if (j.ready) {
-      setStatus("ready");
-      setOutputReady(true);
-      log("Direct job finished. CSV is ready to download.");
-      stopPolling();
-    } else {
-      setStatus(j.status || "running");
-    }
-  } catch (err) {
-    log(`Direct status error: ${err?.message || String(err)}`);
-  }
-}
-
-function startPollingDirect(id) {
-  stopPolling();
-  pollRef.current = setInterval(() => checkDirectStatus(id), 3000);
-}
-
-
-
-function startPollingDirect(id) {
-  stopPolling();
-  pollRef.current = setInterval(() => checkDirectStatus(id), 3000);
-}
-
-  const isGpt5    = model.startsWith("gpt-5");
+  const isGpt5 = model.startsWith("gpt-5");
   const isOseries = /^o\d/i.test(model) || model.startsWith("o");
 
   async function submitBatch(e) {
     e.preventDefault();
-    setError(""); setOutputReady(false); setStatus("");
-    setPreview(null); setDownloadUrl("");
+    setError("");
+    setOutputReady(false);
+    setStatus("");
+    setPreview(null);
+    setDownloadUrl("");
     setLastRunMode(mode);
 
-    if (!file) { setError("Please choose a CSV file."); log("No file selected."); return; }
+    if (!file) {
+      setError("Please choose a CSV file.");
+      log("No file selected.");
+      return;
+    }
 
     try {
       setIsSubmitting(true);
@@ -134,27 +101,35 @@ function startPollingDirect(id) {
 
       log(
         `Submit → mode=${mode}, model=${model}, inputCol=${inputCol}, K=${chunkSize}, reasoning=${reasoningEffort}` +
-        (maxRows ? `, maxRows=${maxRows}` : "") +
-        (mode === "direct" ? `, concurrency=${concurrency}` : "")
+          (maxRows ? `, maxRows=${maxRows}` : "") +
+          (mode === "direct" ? `, concurrency=${concurrency}` : "")
       );
       const t0 = performance.now();
 
       const r = await fetch(`${API_BASE}/batch-create`, { method: "POST", body: fd });
 
       let bodyText = "";
-      try { bodyText = await r.text(); } catch {}
+      try {
+        bodyText = await r.text();
+      } catch {}
 
       const dt = ((performance.now() - t0) / 1000).toFixed(2);
       log(`Response ${r.status} in ${dt}s`);
 
       if (!r.ok) {
-        let msg = bodyText; try { msg = JSON.parse(bodyText).error || msg; } catch {}
+        let msg = bodyText;
+        try {
+          msg = JSON.parse(bodyText).error || msg;
+        } catch {}
         setError(msg || `Request failed (HTTP ${r.status})`);
         log(`Error: ${msg || `HTTP ${r.status}`}`);
         return;
       }
 
-      let j = {}; try { j = JSON.parse(bodyText || "{}"); } catch {}
+      let j = {};
+      try {
+        j = JSON.parse(bodyText || "{}");
+      } catch {}
       const returnedMode = j.mode || mode;
 
       // Handle DRY RUN (preview only)
@@ -166,22 +141,25 @@ function startPollingDirect(id) {
         return;
       }
 
-// Handle DIRECT (CSV will be built by the background worker)
-if (returnedMode === "direct") {
-  const id = j.jobId || "";
-  setBatchId(id);                   // show the panel & reuse the download button
-  setStatus("running");
-  setOutputReady(false);
-  setPreview(null);
-  setDownloadUrl(j.download || `${API_BASE}/batch-download?id=${encodeURIComponent(id)}`);
-  log(`Direct job started. Processing in the background… Polling for readiness.`);
-  startPollingDirect(id);           // start polling direct status
-  return;
-}
-
+      // Handle DIRECT (CSV will be built by the background worker)
+      if (returnedMode === "direct") {
+        const id = j.jobId || "";
+        setBatchId(id); // show the panel & reuse the download button
+        setStatus("running");
+        setOutputReady(false);
+        setPreview(null);
+        setDownloadUrl(j.download || `${API_BASE}/batch-download?id=${encodeURIComponent(id)}`);
+        log(`Direct job started. Processing in the background… Polling for readiness.`);
+        startPollingDirect(id); // start polling direct status
+        return;
+      }
 
       // Batch path (default)
-      if (!j.batchId) { setError("No batchId returned from server."); log("Error: No batchId in response."); return; }
+      if (!j.batchId) {
+        setError("No batchId returned from server.");
+        log("Error: No batchId in response.");
+        return;
+      }
       setBatchId(j.batchId);
       setStatus("submitted");
       log(`Batch created: ${j.batchId}`);
@@ -201,19 +179,76 @@ if (returnedMode === "direct") {
       const r = await fetch(`${API_BASE}/batch-status?id=${encodeURIComponent(batchId)}`);
       const t = await r.text();
       if (!r.ok) {
-        let msg = t; try { msg = JSON.parse(t).error || msg; } catch {}
+        let msg = t;
+        try {
+          msg = JSON.parse(t).error || msg;
+        } catch {}
         setError(msg || `Status failed (HTTP ${r.status})`);
         log(`Status error: ${msg || `HTTP ${r.status}`}`);
         return;
       }
-      let j = {}; try { j = JSON.parse(t); } catch {}
+      let j = {};
+      try {
+        j = JSON.parse(t);
+      } catch {}
       const s = j.status || "(unknown)";
       setStatus(s);
       log(`Batch ${j.id || batchId} → ${s}`);
-      if (s === "completed") { setOutputReady(true); log("Batch completed. You can download the merged CSV."); }
+      if (s === "completed") {
+        setOutputReady(true);
+        log("Batch completed. You can download the merged CSV.");
+      }
     } catch (err) {
       setError(err?.message || String(err));
       log(`Status exception: ${err?.message || String(err)}`);
+    }
+  }
+
+  // ---- Direct mode status poller (progress + events) ----
+  async function checkDirectStatus(idParam) {
+    const id = idParam || batchId;
+    if (!id) return;
+    try {
+      const r = await fetch(`${API_BASE}/direct-status?id=${encodeURIComponent(id)}`);
+      const t = await r.text();
+      let j = {};
+      try {
+        j = JSON.parse(t);
+      } catch {}
+
+      if (j.error) {
+        setStatus("failed");
+        setOutputReady(false);
+        setError(j.error);
+        log(`Direct job failed: ${j.error}`);
+        stopPolling();
+        return;
+      }
+
+      if (j.totalChunks) {
+        log(`Progress: ${j.completedChunks}/${j.totalChunks} chunks, ${j.processedRows ?? "?"} rows processed`);
+      }
+      if (Array.isArray(j.events) && j.events.length) {
+        const last = j.events[j.events.length - 1];
+        if (last?.ts && last?.msg) log(`bg: ${last.msg}`);
+      }
+
+      if (j.ready) {
+        setStatus("ready");
+        setOutputReady(true);
+        log("Direct job finished. CSV is ready to download.");
+        stopPolling();
+      } else if (j.status === "failed") {
+        setStatus("failed");
+        setOutputReady(false);
+        setError(j.error || "Direct job failed.");
+        log(`Direct job failed: ${j.error || "(unknown error)"}`);
+        stopPolling();
+      } else {
+        setStatus(j.status || "running");
+      }
+    } catch (err) {
+      log(`Direct status error: ${err?.message || String(err)}`);
     }
   }
 
@@ -225,10 +260,16 @@ if (returnedMode === "direct") {
     window.location.href = url;
   }
 
-  function clearLogs() { setLogs([]); }
+  function clearLogs() {
+    setLogs([]);
+  }
   async function copyLogs() {
-    try { await navigator.clipboard.writeText(logs.join("\n")); log("Logs copied to clipboard."); }
-    catch { log("Copy failed (clipboard permissions)."); }
+    try {
+      await navigator.clipboard.writeText(logs.join("\n"));
+      log("Logs copied to clipboard.");
+    } catch {
+      log("Copy failed (clipboard permissions).");
+    }
   }
 
   return (
@@ -243,22 +284,36 @@ if (returnedMode === "direct") {
       </p>
 
       <form onSubmit={submitBatch} style={{ display: "grid", gap: 12 }}>
-        <label>CSV File
-          <input type="file" accept=".csv" onChange={(e) => {
-            const f = e.target.files?.[0] || null; setFile(f);
-            if (f) log(`Selected file: ${f.name} (${f.size.toLocaleString()} bytes)`);
-          }}/>
+        <label>
+          CSV File
+          <input
+            type="file"
+            accept=".csv"
+            onChange={(e) => {
+              const f = e.target.files?.[0] || null;
+              setFile(f);
+              if (f) log(`Selected file: ${f.name} (${f.size.toLocaleString()} bytes)`);
+            }}
+          />
         </label>
 
-        <label>Input column name
+        <label>
+          Input column name
           <input value={inputCol} onChange={(e) => setInputCol(e.target.value)} placeholder="text" />
         </label>
 
-        <label>Instruction prompt
-          <textarea rows={6} value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="Describe what to do with each row..." />
+        <label>
+          Instruction prompt
+          <textarea
+            rows={6}
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder="Describe what to do with each row..."
+          />
         </label>
 
-        <label>Model
+        <label>
+          Model
           <select value={model} onChange={(e) => setModel(e.target.value)}>
             {/* Add GPT-5 options if your org has access */}
             <option>gpt-5</option>
@@ -271,8 +326,9 @@ if (returnedMode === "direct") {
         </label>
 
         {(isGpt5 || isOseries) && (
-          <label>Reasoning effort
-            <select value={reasoningEffort} onChange={e => setReasoningEffort(e.target.value)}>
+          <label>
+            Reasoning effort
+            <select value={reasoningEffort} onChange={(e) => setReasoningEffort(e.target.value)}>
               <option value="minimal">minimal</option>
               <option value="low">low</option>
               <option value="medium">medium</option>
@@ -281,7 +337,8 @@ if (returnedMode === "direct") {
           </label>
         )}
 
-        <label>Rows per request (K)
+        <label>
+          Rows per request (K)
           <input
             type="number"
             min={1}
@@ -293,7 +350,8 @@ if (returnedMode === "direct") {
 
         {/* Mode + test helpers */}
         <div style={{ display: "grid", gap: 8 }}>
-          <label>Mode
+          <label>
+            Mode
             <select value={mode} onChange={(e) => setMode(e.target.value)}>
               <option value="batch">Batch (slow, cheapest at scale)</option>
               <option value="dry">Dry run (first chunk now)</option>
@@ -302,7 +360,8 @@ if (returnedMode === "direct") {
           </label>
 
           <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-            <label>Max rows (test)
+            <label>
+              Max rows (test)
               <input
                 type="number"
                 min={0}
@@ -313,55 +372,65 @@ if (returnedMode === "direct") {
               />
             </label>
 
-            <label>Concurrency
-<input
-  type="number"
-  min={1}
-  // max={32} // optional: set a higher visible ceiling
-  value={concurrency}
-  onChange={(e) => setConcurrency(Number(e.target.value || 1))}
-  style={{ width: 90, marginLeft: 8 }}
-  disabled={mode !== "direct"}
-  title="Parallel /v1/responses calls (Direct mode only)"
-/>
-
+            <label>
+              Concurrency
+              <input
+                type="number"
+                min={1}
+                value={concurrency}
+                onChange={(e) => setConcurrency(Number(e.target.value || 1))}
+                style={{ width: 90, marginLeft: 8 }}
+                disabled={mode !== "direct"}
+                title="Parallel /v1/responses calls (Direct mode only)"
+              />
             </label>
           </div>
         </div>
 
-        <button type="submit" disabled={isSubmitting} style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+        <button
+          type="submit"
+          disabled={isSubmitting}
+          style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
+        >
           {isSubmitting ? (mode === "batch" ? "Creating Batch…" : "Processing…") : (mode === "batch" ? "Create Batch" : "Run Now")}
           {isSubmitting && <span aria-hidden>⏳</span>}
         </button>
       </form>
 
       {/* Job panel (works for Batch AND Direct) */}
-{batchId && (
-  <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
-    <div><strong>Job ID:</strong> {batchId}</div>
-    <div><strong>Status:</strong> {status || (lastRunMode === "direct" ? "running" : "(unknown)")} </div>
+      {batchId && (
+        <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
+          <div>
+            <strong>Job ID:</strong> {batchId}
+          </div>
+          <div>
+            <strong>Status:</strong> {status || (lastRunMode === "direct" ? "running" : "(unknown)")}{" "}
+          </div>
 
-    {lastRunMode === "direct" && !outputReady && (
-      <div style={{ marginTop: 6, fontSize: 13, opacity: 0.8 }}>
-        Building CSV in the background… you can refresh the status or leave this tab.
-      </div>
-    )}
+          {lastRunMode === "direct" && !outputReady && (
+            <div style={{ marginTop: 6, fontSize: 13, opacity: 0.8 }}>
+              Building CSV in the background… you can refresh the status or leave this tab.
+            </div>
+          )}
 
-    <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-      {lastRunMode === "batch"  && <button onClick={checkStatus}>Refresh Status</button>}
-      {lastRunMode === "direct" && <button onClick={() => checkDirectStatus()}>Refresh Status</button>}
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            {lastRunMode === "batch" && <button onClick={checkStatus}>Refresh Status</button>}
+            {lastRunMode === "direct" && <button onClick={() => checkDirectStatus()}>Refresh Status</button>}
 
-      <button onClick={downloadOutput} disabled={!outputReady}>Download merged CSV</button>
+            <button onClick={downloadOutput} disabled={!outputReady}>
+              Download merged CSV
+            </button>
 
-      {lastRunMode === "direct" && downloadUrl && (
-        <a href={downloadUrl} style={{ alignSelf: "center" }}>Open link</a>
+            {lastRunMode === "direct" && downloadUrl && (
+              <a href={downloadUrl} style={{ alignSelf: "center" }}>
+                Open link
+              </a>
+            )}
+          </div>
+
+          {error && <p style={{ color: "crimson", marginTop: 8 }}>{error}</p>}
+        </div>
       )}
-    </div>
-
-    {error && <p style={{ color: "crimson", marginTop: 8 }}>{error}</p>}
-  </div>
-)}
-
 
       {/* Dry preview panel */}
       {!batchId && preview && lastRunMode === "dry" && (
@@ -369,10 +438,19 @@ if (returnedMode === "direct") {
           <div style={{ marginBottom: 6 }}>
             <strong>Preview</strong> (Dry run: first chunk only)
           </div>
-          <pre style={{
-            background: "#0b1020", color: "#d7e3ff", padding: 12, borderRadius: 8,
-            maxHeight: 260, overflow: "auto", whiteSpace: "pre-wrap", fontSize: 13, lineHeight: 1.45
-          }}>
+          <pre
+            style={{
+              background: "#0b1020",
+              color: "#d7e3ff",
+              padding: 12,
+              borderRadius: 8,
+              maxHeight: 260,
+              overflow: "auto",
+              whiteSpace: "pre-wrap",
+              fontSize: 13,
+              lineHeight: 1.45,
+            }}
+          >
 {JSON.stringify(preview, null, 2)}
           </pre>
           {error && <p style={{ color: "crimson", marginTop: 8 }}>{error}</p>}
@@ -383,14 +461,28 @@ if (returnedMode === "direct") {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
           <h2 style={{ margin: 0, fontSize: 18 }}>Console</h2>
           <div style={{ display: "flex", gap: 8 }}>
-            <button type="button" onClick={clearLogs}>Clear</button>
-            <button type="button" onClick={copyLogs}>Copy</button>
+            <button type="button" onClick={clearLogs}>
+              Clear
+            </button>
+            <button type="button" onClick={copyLogs}>
+              Copy
+            </button>
           </div>
         </div>
-        <pre ref={logRef} style={{
-          background: "#0b1020", color: "#d7e3ff", padding: 12, borderRadius: 8,
-          maxHeight: 260, overflow: "auto", whiteSpace: "pre-wrap", fontSize: 13, lineHeight: 1.45
-        }}>
+        <pre
+          ref={logRef}
+          style={{
+            background: "#0b1020",
+            color: "#d7e3ff",
+            padding: 12,
+            borderRadius: 8,
+            maxHeight: 260,
+            overflow: "auto",
+            whiteSpace: "pre-wrap",
+            fontSize: 13,
+            lineHeight: 1.45,
+          }}
+        >
 {logs.length ? logs.join("\n") : "Console will show progress, HTTP codes, and errors…"}
         </pre>
       </div>
