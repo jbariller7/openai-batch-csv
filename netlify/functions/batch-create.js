@@ -1,20 +1,13 @@
-// netlify/functions/batch-create.js  (ESM)
+// netlify/functions/batch-create.js  (CommonJS)
 
-import OpenAI, { toFile } from "openai";
-import { getStore } from "@netlify/blobs";
-import Busboy from "busboy";
-import { parse as csvParse } from "csv-parse";
-import { stringify as csvStringify } from "csv-stringify";
-
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-// Max parallel calls for Direct mode; override in Netlify env with MAX_DIRECT_CONCURRENCY
-const MAX_DIRECT_CONCURRENCY = Number(process.env.MAX_DIRECT_CONCURRENCY || 8);
-
-// Optional pretty path when invoking as /.netlify/functions/*
-export const config = { /* path: "/api/batch-create" */ };
+const Busboy = require("busboy");
+const { parse: csvParse } = require("csv-parse");
+const { stringify: csvStringify } = require("csv-stringify");
 
 // Some models (gpt-5 family) don't support temperature
 const supportsTemperature = (name) => !/^gpt-5(\b|[-_])/.test(name);
+
+exports.config = { /* path: "/api/batch-create" */ };
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -80,7 +73,7 @@ function parseMultipartEvent(event) {
   });
 }
 
-export default async function handler(reqOrEvent) {
+exports.handler = async function handler(reqOrEvent) {
   const method = getMethod(reqOrEvent);
   const query = getQuery(reqOrEvent);
 
@@ -93,6 +86,13 @@ export default async function handler(reqOrEvent) {
       headers: { ...CORS, "Content-Type": "application/json" },
     });
   }
+
+  // Dynamically import ESM deps here (works in Node 18 without ESM project config)
+  const { getStore } = await import("@netlify/blobs");
+  const openaiMod = await import("openai");
+  const OpenAI = openaiMod.default;
+  const { toFile } = openaiMod;
+  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
   try {
     // 1) Parse multipart form
@@ -128,11 +128,11 @@ export default async function handler(reqOrEvent) {
     const maxRows = Number(fields.maxRows || query.maxRows || 0) || 0;
     const dryRun = String(fields.dryRun || query.dryRun || "") === "1";
     const direct = String(fields.direct || query.direct || "") === "1";
+    const MAX_DIRECT_CONCURRENCY = Number(process.env.MAX_DIRECT_CONCURRENCY || 8);
     const concurrency = Math.max(
-  1,
-  Math.min(MAX_DIRECT_CONCURRENCY, Number(fields.concurrency || query.concurrency || 4))
-);
-
+      1,
+      Math.min(MAX_DIRECT_CONCURRENCY, Number(fields.concurrency || query.concurrency || 4))
+    );
 
     if (!fileBuffer) {
       return new Response(JSON.stringify({ error: "CSV file is required" }), {
@@ -144,9 +144,9 @@ export default async function handler(reqOrEvent) {
     // 2) Store original CSV in Netlify Blobs
     const jobId = crypto.randomUUID();
     const store = getStore("openai-batch-csv");
-    await store.set(`csv/${jobId}.csv`, fileBuffer);
+    await store.set(`csv/${jobId}.csv`, fileBuffer, { contentType: "text/csv; charset=utf-8" });
 
-    // 3) Parse CSV
+    // 3) Parse CSV (as text)
     const rows = await new Promise((resolve, reject) => {
       const out = [];
       csvParse(fileBuffer, {
@@ -214,50 +214,48 @@ export default async function handler(reqOrEvent) {
       );
     }
 
-// 5) DIRECT: kick off a Background Function to do the work, return immediately
-if (direct) {
-  // Persist metadata the worker needs
-await store.set(
-  `jobs/${jobId}.json`,
-  JSON.stringify({
-    jobId,
-    model,
-    prompt,
-    inputCol,
-    chunkSize,
-    reasoningEffort,
-    concurrency,
-    createdAt: new Date().toISOString(),
-  }),
-  { contentType: "application/json" }
-);
+    // 5) DIRECT: kick off a Background Function; return immediately (no 504s)
+    if (direct) {
+      // Persist metadata for the worker
+      await store.set(
+        `jobs/${jobId}.json`,
+        JSON.stringify({
+          jobId,
+          model,
+          prompt,
+          inputCol,
+          chunkSize,
+          reasoningEffort,
+          concurrency,
+          createdAt: new Date().toISOString(),
+        }),
+        { contentType: "application/json" }
+      );
 
+      // Call the background worker (fire-and-forget)
+      const baseUrl =
+        process.env.URL ||
+        process.env.DEPLOY_URL ||
+        process.env.DEPLOY_PRIME_URL ||
+        "http://localhost:8888";
 
-  // Invoke the background worker
-  const baseUrl =
-    process.env.URL ||
-    process.env.DEPLOY_URL ||
-    process.env.DEPLOY_PRIME_URL ||
-    "http://localhost:8888";
-  // Fire-and-forget; we don't await the whole processing (the function returns 202 quickly)
-  await fetch(`${baseUrl}/.netlify/functions/direct-worker-background`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jobId }),
-  }).catch(() => { /* ignore network hiccups; worker may still run */ });
+      fetch(`${baseUrl}/.netlify/functions/direct-worker-background`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId }),
+      }).catch(() => {});
 
-  return new Response(
-    JSON.stringify({
-      mode: "direct",
-      jobId,
-      model,
-      rowCount: effectiveRows.length,
-      download: `/.netlify/functions/batch-download?id=${jobId}`,
-    }),
-    { status: 202, headers: { ...CORS, "Content-Type": "application/json" } }
-  );
-}
-
+      return new Response(
+        JSON.stringify({
+          mode: "direct",
+          jobId,
+          model,
+          rowCount: effectiveRows.length,
+          download: `/.netlify/functions/batch-download?id=${jobId}`,
+        }),
+        { status: 202, headers: { ...CORS, "Content-Type": "application/json" } }
+      );
+    }
 
     // 6) BATCH: build JSONL lines and enqueue
     const lines = [];
@@ -305,7 +303,21 @@ await store.set(
     });
 
     // Persist job metadata
-store.setJSON(`jobs/${batch.id}.json`, {
+    await store.set(
+      `jobs/${batch.id}.json`,
+      JSON.stringify({
+        jobId,
+        batchId: batch.id,
+        inputCol,
+        model,
+        prompt,
+        chunkSize,
+        reasoningEffort,
+        createdAt: new Date().toISOString(),
+        rowCount: effectiveRows.length,
+      }),
+      { contentType: "application/json" }
+    );
 
     return new Response(
       JSON.stringify({ mode: "batch", batchId: batch.id, jobId }),
@@ -318,4 +330,4 @@ store.setJSON(`jobs/${batch.id}.json`, {
       { status: 500, headers: { ...CORS, "Content-Type": "application/json" } }
     );
   }
-}
+};
