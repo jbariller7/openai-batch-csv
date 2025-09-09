@@ -276,7 +276,7 @@ export default async function handler(reqOrEvent) {
         });
       });
 
-      await store.set(`results/${jobId}.csv`, csvStr);
+      await store.set(`results/${jobId}.csv`, csvStr, { contentType: "text/csv; charset=utf-8" });
 
       return new Response(
         JSON.stringify({
