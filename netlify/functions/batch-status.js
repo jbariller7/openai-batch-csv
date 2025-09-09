@@ -1,54 +1,24 @@
-import OpenAI from "openai";
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// netlify/functions/batch-status.js (CommonJS + Lambda-style)
 
-export const config = { /* path: "/api/batch-status" */ };
+exports.config = { /* path: "/api/batch-status" */ };
 
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,OPTIONS,HEAD",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
-
-function getMethod(req) {
-  if (req && typeof req.method === "string") return req.method;
-  if (req && typeof req.httpMethod === "string") return req.httpMethod;
-  return "GET";
-}
-function getUrl(req) {
-  return typeof req.url === "string" ? req.url : (req.rawUrl || "");
+function res(statusCode, bodyObj) {
+  return { statusCode, headers: { "Content-Type": "application/json" }, body: JSON.stringify(bodyObj ?? {}) };
 }
 
-export default async (reqOrEvent) => {
-  const method = getMethod(reqOrEvent);
-  if (method === "OPTIONS" || method === "HEAD") {
-    return new Response("", { status: 204, headers: CORS });
-  }
+exports.handler = async function (event) {
+  const urlStr = typeof event?.rawUrl === "string" ? event.rawUrl : "";
+  const url = urlStr ? new URL(urlStr) : null;
+  const id = url?.searchParams.get("id") || event?.queryStringParameters?.id || "";
+  if (!id) return res(400, { error: "Missing id" });
 
-  const url = new URL(getUrl(reqOrEvent));
-  const id = url.searchParams.get("id");
-  if (!id) {
-    return new Response(JSON.stringify({ error: "Missing id" }), {
-      status: 400,
-      headers: CORS,
-    });
-  }
+  const { default: OpenAI } = await import("openai");
+  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
   try {
     const b = await client.batches.retrieve(id);
-    return new Response(
-      JSON.stringify({
-        id: b.id,
-        status: b.status,
-        created_at: b.created_at,
-        output_file_id: b.output_file_id || null,
-      }),
-      { status: 200, headers: { ...CORS, "Content-Type": "application/json" } }
-    );
+    return res(200, b);
   } catch (e) {
-    console.error("batch-status error:", e);
-    return new Response(JSON.stringify({ error: e.message }), {
-      status: 500,
-      headers: CORS,
-    });
+    return res(500, { error: e?.message || String(e) });
   }
 };
