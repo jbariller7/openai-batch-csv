@@ -74,7 +74,7 @@ if (typeof directCsvText === "string") {
       });
     }
 
-    const meta = await store.getJSON(`jobs/${id}.json`);
+    const meta = await store.get(`jobs/${id}.json`, { type: "json" });
     if (!meta) {
       return new Response(JSON.stringify({ error: "Job metadata not found" }), {
         status: 404,
@@ -83,8 +83,8 @@ if (typeof directCsvText === "string") {
     }
 
     // Read original CSV rows
-    const csvBuf = await store.get(`csv/${meta.jobId}.csv`, { type: "buffer" });
-    if (!csvBuf) {
+    const csvTxt = await store.get(`csv/${meta.jobId}.csv`, { type: "text" });
+    if (!csvTxt) {
       return new Response(JSON.stringify({ error: "Original CSV not found" }), {
         status: 404,
         headers: CORS,
@@ -93,7 +93,7 @@ if (typeof directCsvText === "string") {
 
     const rows = await new Promise((resolve, reject) => {
       const out = [];
-      csvParse(csvBuf, { columns: true, relax_quotes: true })
+      csvParse(csvTxt, { columns: true, relax_quotes: true })
         .on("data", (r) => out.push(r))
         .on("end", () => resolve(out))
         .on("error", reject);
