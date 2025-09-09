@@ -1,13 +1,7 @@
-// netlify/functions/batch-create.js  (CommonJS)
+// netlify/functions/batch-create.js (CommonJS + Lambda-style returns)
 
 const Busboy = require("busboy");
 const { parse: csvParse } = require("csv-parse");
-const { stringify: csvStringify } = require("csv-stringify");
-
-// Some models (gpt-5 family) don't support temperature
-const supportsTemperature = (name) => !/^gpt-5(\b|[-_])/.test(name);
-
-exports.config = { /* path: "/api/batch-create" */ };
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -15,36 +9,34 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-function getMethod(reqOrEvent) {
-  if (reqOrEvent && typeof reqOrEvent.method === "string") return reqOrEvent.method;
-  if (reqOrEvent && typeof reqOrEvent.httpMethod === "string") return reqOrEvent.httpMethod;
-  return "GET";
-}
-function hasFormData(reqOrEvent) {
-  return reqOrEvent && typeof reqOrEvent.formData === "function";
-}
-function getQuery(reqOrEvent) {
-  if (reqOrEvent && typeof reqOrEvent.queryStringParameters === "object") {
-    return reqOrEvent.queryStringParameters || {};
-  }
-  try {
-    const url = typeof reqOrEvent?.url === "string" ? new URL(reqOrEvent.url) : null;
-    return url ? Object.fromEntries(url.searchParams.entries()) : {};
-  } catch {
-    return {};
-  }
+exports.config = { /* path: "/api/batch-create" */ };
+
+const supportsTemperature = (name) => !/^gpt-5(\b|[-_])/.test(name);
+
+function res(statusCode, bodyObj, headers) {
+  return {
+    statusCode,
+    headers: { "Content-Type": "application/json", ...(headers || {}), ...CORS },
+    body: JSON.stringify(bodyObj ?? {}),
+  };
 }
 
-// Parse multipart for Node/event using Busboy
+function getQuery(event) {
+  if (event && event.queryStringParameters) return event.queryStringParameters || {};
+  try {
+    const url = typeof event?.rawUrl === "string" ? new URL(event.rawUrl) : null;
+    return url ? Object.fromEntries(url.searchParams.entries()) : {};
+  } catch { return {}; }
+}
+
+// Parse multipart with Busboy (Lambda event)
 function parseMultipartEvent(event) {
   return new Promise((resolve, reject) => {
+    const headers = event.headers || {};
     const bb = Busboy({
       headers: {
-        "content-type":
-          event.headers?.["content-type"] ||
-          event.headers?.["Content-Type"] ||
-          "",
-      },
+        "content-type": headers["content-type"] || headers["Content-Type"] || ""
+      }
     });
 
     const fields = {};
@@ -55,7 +47,6 @@ function parseMultipartEvent(event) {
       fileInfo = info; // { filename, mimeType, encoding }
       file.on("data", (d) => fileBuffers.push(d));
     });
-
     bb.on("field", (name, val) => (fields[name] = val));
     bb.on("error", reject);
     bb.on("finish", () => {
@@ -73,21 +64,15 @@ function parseMultipartEvent(event) {
   });
 }
 
-exports.handler = async function handler(reqOrEvent) {
-  const method = getMethod(reqOrEvent);
-  const query = getQuery(reqOrEvent);
-
-  if (method === "OPTIONS" || method === "HEAD") {
-    return new Response("", { status: 204, headers: CORS });
+exports.handler = async function (event) {
+  if (event.httpMethod === "OPTIONS" || event.httpMethod === "HEAD") {
+    return { statusCode: 204, headers: CORS, body: "" };
   }
-  if (method !== "POST") {
-    return new Response(JSON.stringify({ error: "POST only" }), {
-      status: 405,
-      headers: { ...CORS, "Content-Type": "application/json" },
-    });
+  if (event.httpMethod !== "POST") {
+    return res(405, { error: "POST only" });
   }
 
-  // Dynamically import ESM deps here (works in Node 18 without ESM project config)
+  // ESM deps (loaded at runtime)
   const { getStore } = await import("@netlify/blobs");
   const openaiMod = await import("openai");
   const OpenAI = openaiMod.default;
@@ -95,36 +80,18 @@ exports.handler = async function handler(reqOrEvent) {
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
   try {
-    // 1) Parse multipart form
-    let fields = {};
-    let fileBuffer = null;
-
-    if (hasFormData(reqOrEvent)) {
-      // Web API (Deno-like Request)
-      const form = await reqOrEvent.formData();
-      for (const [k, v] of form.entries()) {
-        if (v && typeof v.arrayBuffer === "function") {
-          const ab = await v.arrayBuffer();
-          fileBuffer = Buffer.from(ab);
-        } else {
-          fields[k] = String(v);
-        }
-      }
-    } else {
-      // Node/event
-      const out = await parseMultipartEvent(reqOrEvent);
-      fields = out.fields || {};
-      fileBuffer = out.fileBuffer || null;
-    }
+    // Parse multipart
+    const { fields, fileBuffer } = await parseMultipartEvent(event);
 
     const inputCol = fields.inputCol || "text";
     const model = fields.model || "gpt-4.1-mini";
     const prompt = fields.prompt || "Translate to English.";
     const completionWindow = fields.completionWindow || "24h";
     const chunkSize = Math.max(1, Math.min(1000, Number(fields.chunkSize || 200)));
-    const reasoningEffort = (fields.reasoning_effort || "").trim(); // "minimal" | "low" | "medium" | "high"
+    const reasoningEffort = (fields.reasoning_effort || "").trim();
 
-    // Testing flags (can be set by form fields or query params)
+    // testing flags
+    const query = getQuery(event);
     const maxRows = Number(fields.maxRows || query.maxRows || 0) || 0;
     const dryRun = String(fields.dryRun || query.dryRun || "") === "1";
     const direct = String(fields.direct || query.direct || "") === "1";
@@ -135,37 +102,23 @@ exports.handler = async function handler(reqOrEvent) {
     );
 
     if (!fileBuffer) {
-      return new Response(JSON.stringify({ error: "CSV file is required" }), {
-        status: 400,
-        headers: { ...CORS, "Content-Type": "application/json" },
-      });
+      return res(400, { error: "CSV file is required" });
     }
 
-    // 2) Store original CSV in Netlify Blobs
+    // Store original CSV
     const jobId = crypto.randomUUID();
     const store = getStore("openai-batch-csv");
     await store.set(`csv/${jobId}.csv`, fileBuffer, { contentType: "text/csv; charset=utf-8" });
 
-    // 3) Parse CSV (as text)
+    // Parse CSV
     const rows = await new Promise((resolve, reject) => {
       const out = [];
-      csvParse(fileBuffer, {
-        columns: true,
-        relax_quotes: true,
-        skip_empty_lines: true,
-        bom: true,
-      })
+      csvParse(fileBuffer, { columns: true, relax_quotes: true, skip_empty_lines: true, bom: true })
         .on("data", (r) => out.push(r))
         .on("end", () => resolve(out))
         .on("error", reject);
     });
-
-    if (!rows.length) {
-      return new Response(JSON.stringify({ error: "CSV has no rows" }), {
-        status: 400,
-        headers: { ...CORS, "Content-Type": "application/json" },
-      });
-    }
+    if (!rows.length) return res(400, { error: "CSV has no rows" });
 
     const effectiveRows = maxRows > 0 ? rows.slice(0, maxRows) : rows;
     const supportsReasoning =
@@ -177,13 +130,12 @@ exports.handler = async function handler(reqOrEvent) {
       + ' The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]}'
       + ' in the SAME ORDER as input. Do not include any commentary.';
 
-    // 4) DRY RUN: run first chunk immediately with /v1/responses
+    // DRY RUN
     if (dryRun) {
       const firstChunk = effectiveRows.slice(0, chunkSize).map((r, j) => ({
         id: j,
         text: String(r?.[inputCol] ?? ""),
       }));
-
       const body = {
         model,
         input: [
@@ -195,76 +147,51 @@ exports.handler = async function handler(reqOrEvent) {
         ...(supportsTemperature(model) ? { temperature: 0 } : {}),
         ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
       };
-
       const resp = await client.responses.create(body);
-
-      let parsed = null;
-      try { parsed = JSON.parse(resp.output_text || ""); } catch {}
-
-      return new Response(
-        JSON.stringify({
-          mode: "dryRun",
-          jobId,
-          usedRows: firstChunk.length,
-          model,
-          response: resp,
-          parsed,
-        }),
-        { status: 200, headers: { ...CORS, "Content-Type": "application/json" } }
-      );
+      let parsed = null; try { parsed = JSON.parse(resp.output_text || ""); } catch {}
+      return res(200, { mode: "dryRun", jobId, usedRows: firstChunk.length, model, response: resp, parsed });
     }
 
-    // 5) DIRECT: kick off a Background Function; return immediately (no 504s)
+    // DIRECT → kick off background function (no 504s)
     if (direct) {
-      // Persist metadata for the worker
       await store.set(
         `jobs/${jobId}.json`,
         JSON.stringify({
-          jobId,
-          model,
-          prompt,
-          inputCol,
-          chunkSize,
-          reasoningEffort,
-          concurrency,
+          jobId, model, prompt, inputCol, chunkSize, reasoningEffort, concurrency,
           createdAt: new Date().toISOString(),
         }),
         { contentType: "application/json" }
       );
 
-      // Call the background worker (fire-and-forget)
       const baseUrl =
         process.env.URL ||
         process.env.DEPLOY_URL ||
         process.env.DEPLOY_PRIME_URL ||
         "http://localhost:8888";
 
+      // fire-and-forget; background function returns 202 immediately
       fetch(`${baseUrl}/.netlify/functions/direct-worker-background`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jobId }),
       }).catch(() => {});
 
-      return new Response(
-        JSON.stringify({
-          mode: "direct",
-          jobId,
-          model,
-          rowCount: effectiveRows.length,
-          download: `/.netlify/functions/batch-download?id=${jobId}`,
-        }),
-        { status: 202, headers: { ...CORS, "Content-Type": "application/json" } }
-      );
+      return res(202, {
+        mode: "direct",
+        jobId,
+        model,
+        rowCount: effectiveRows.length,
+        download: `/.netlify/functions/batch-download?id=${jobId}`,
+      });
     }
 
-    // 6) BATCH: build JSONL lines and enqueue
+    // BATCH
     const lines = [];
     for (let start = 0; start < effectiveRows.length; start += chunkSize) {
       const chunk = effectiveRows.slice(start, start + chunkSize).map((r, j) => ({
         id: start + j,
         text: String(r?.[inputCol] ?? ""),
       }));
-
       const body = {
         model,
         input: [
@@ -276,58 +203,32 @@ exports.handler = async function handler(reqOrEvent) {
         ...(supportsTemperature(model) ? { temperature: 0 } : {}),
         ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
       };
-
-      lines.push(
-        JSON.stringify({
-          custom_id: String(start),
-          method: "POST",
-          url: "/v1/responses",
-          body,
-        })
-      );
+      lines.push(JSON.stringify({ custom_id: String(start), method: "POST", url: "/v1/responses", body }));
     }
 
     const jsonlBuffer = Buffer.from(lines.join("\n"), "utf8");
-
-    // Upload JSONL using SDK helper for cross-runtime compatibility
     const jsonlFile = await client.files.create({
       file: await toFile(jsonlBuffer, `${jobId}.jsonl`, { type: "application/jsonl" }),
       purpose: "batch",
     });
-
-    // Create Batch
     const batch = await client.batches.create({
       input_file_id: jsonlFile.id,
       endpoint: "/v1/responses",
-      completion_window: completionWindow, // "24h" or "4h"
+      completion_window: completionWindow,
     });
 
-    // Persist job metadata
     await store.set(
       `jobs/${batch.id}.json`,
       JSON.stringify({
-        jobId,
-        batchId: batch.id,
-        inputCol,
-        model,
-        prompt,
-        chunkSize,
-        reasoningEffort,
-        createdAt: new Date().toISOString(),
-        rowCount: effectiveRows.length,
+        jobId, batchId: batch.id, inputCol, model, prompt, chunkSize, reasoningEffort,
+        createdAt: new Date().toISOString(), rowCount: effectiveRows.length,
       }),
       { contentType: "application/json" }
     );
 
-    return new Response(
-      JSON.stringify({ mode: "batch", batchId: batch.id, jobId }),
-      { status: 200, headers: { ...CORS, "Content-Type": "application/json" } }
-    );
+    return res(200, { mode: "batch", batchId: batch.id, jobId });
   } catch (err) {
     console.error("batch-create error:", err);
-    return new Response(
-      JSON.stringify({ error: err?.message || String(err) }),
-      { status: 500, headers: { ...CORS, "Content-Type": "application/json" } }
-    );
+    return res(500, { error: err?.message || String(err) });
   }
 };
