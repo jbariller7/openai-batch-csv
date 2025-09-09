@@ -36,7 +36,12 @@ export default async function handler(req) {
       updatedAt: new Date().toISOString(),
       ...extra,
     };
-    try { await store.setJSON(`jobs/${jobId}.status.json`, payload); } catch {}
+    try { await store.set(
+  `jobs/${jobId}.status.json`,
+  JSON.stringify(payload),
+  { contentType: "application/json" }
+);
+ } catch {}
   }
 
   try {
@@ -47,7 +52,8 @@ export default async function handler(req) {
     store = getStore("openai-batch-csv");
     await writeStatus("running");
 
-    const meta = await store.getJSON(`jobs/${jobId}.json`);
+    const meta = await store.get(`jobs/${jobId}.json`, { type: "json" });
+
     if (!meta) {
       await writeStatus("failed", { error: "Job metadata not found" });
       return json({ error: "Job metadata not found" }, 404);
@@ -66,15 +72,16 @@ export default async function handler(req) {
       /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
 
     // Read original CSV
-    const csvBuf = await store.get(`csv/${jobId}.csv`, { type: "buffer" }).catch(() => null);
-    if (!csvBuf) {
+    const csvTxt = await store.get(`csv/${jobId}.csv`, { type: "text" }).catch(() => null);
+    if (! csvTxt) {
       await writeStatus("failed", { error: "Original CSV not found" });
       return json({ error: "Original CSV not found" }, 404);
     }
 
     const rows = await new Promise((resolve, reject) => {
       const out = [];
-      csvParse(csvBuf, { columns: true, relax_quotes: true, bom: true, skip_empty_lines: true })
+      csvParse(csvTxt, { columns: true, relax_quotes: true, bom: true, skip_empty_lines: true })
+
         .on("data", (r) => out.push(r))
         .on("end", () => resolve(out))
         .on("error", reject);
@@ -169,13 +176,18 @@ export default async function handler(req) {
   } catch (err) {
     console.error("direct-worker-background error:", err);
     try {
-      await (store || getStore("openai-batch-csv"))
-        .setJSON(`jobs/${jobId}.status.json`, {
-          jobId,
-          status: "failed",
-          error: err?.message || String(err),
-          updatedAt: new Date().toISOString(),
-        });
+const s = store || getStore("openai-batch-csv");
+await s.set(
+  `jobs/${jobId}.status.json`,
+  JSON.stringify({
+    jobId,
+    status: "failed",
+    error: err?.message || String(err),
+    updatedAt: new Date().toISOString(),
+  }),
+  { contentType: "application/json" }
+);
+
     } catch {}
     return json({ error: err?.message || String(err) }, 500);
   }
