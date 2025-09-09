@@ -1,19 +1,15 @@
-// netlify/functions/direct-status.js  (CommonJS + Lambda-style returns)
+// netlify/functions/direct-status.js (CommonJS + Lambda-style)
 
 exports.config = { /* path: "/api/direct-status" */ };
 
-function res(statusCode, bodyObj, extraHeaders) {
-  return {
-    statusCode,
-    headers: { "Content-Type": "application/json", ...(extraHeaders || {}) },
-    body: JSON.stringify(bodyObj ?? {}),
-  };
+function res(statusCode, bodyObj) {
+  return { statusCode, headers: { "Content-Type": "application/json" }, body: JSON.stringify(bodyObj ?? {}) };
 }
 
 exports.handler = async function (event) {
-  const urlStr = typeof event?.url === "string" ? event.url : (event?.rawUrl || "");
+  const urlStr = typeof event?.rawUrl === "string" ? event.rawUrl : "";
   const url = urlStr ? new URL(urlStr) : null;
-  const id = url?.searchParams.get("id") || (event?.queryStringParameters?.id || "");
+  const id = url?.searchParams.get("id") || event?.queryStringParameters?.id || "";
 
   if (!id) return res(400, { error: "Missing id" });
 
@@ -24,13 +20,9 @@ exports.handler = async function (event) {
     let statusJson = null;
     try { statusJson = await store.get(`jobs/${id}.status.json`, { type: "json" }); } catch {}
 
-    // If no explicit status yet, check for CSV presence
     let csvExists = false;
     if (!statusJson || statusJson.status !== "ready") {
-      try {
-        const txt = await store.get(`results/${id}.csv`, { type: "text" });
-        csvExists = typeof txt === "string";
-      } catch {}
+      try { csvExists = typeof (await store.get(`results/${id}.csv`, { type: "text" })) === "string"; } catch {}
     }
 
     const ready = statusJson?.status === "ready" || csvExists;
