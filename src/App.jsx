@@ -45,32 +45,51 @@ export default function App() {
     if (terminal.includes(status)) stopPolling();
   }, [status]);
 
-  async function checkDirectStatus(idParam) {
+ // Put these below your other helpers (e.g., after checkStatus)
+async function checkDirectStatus(idParam) {
   const id = idParam || batchId;
   if (!id) return;
   try {
     const r = await fetch(`${API_BASE}/direct-status?id=${encodeURIComponent(id)}`);
     const t = await r.text();
     let j = {}; try { j = JSON.parse(t); } catch {}
+
+    if (j.error) {
+      setStatus("failed");
+      setOutputReady(false);
+      setError(j.error);
+      log(`Direct job failed: ${j.error}`);
+      stopPolling();
+      return;
+    }
+
+    // progress logs (optional but helpful)
+    if (j.totalChunks) {
+      log(`Progress: ${j.completedChunks}/${j.totalChunks} chunks, ${j.processedRows ?? "?"} rows processed`);
+    }
+    if (Array.isArray(j.events) && j.events.length) {
+      const last = j.events[j.events.length - 1];
+      if (last?.ts && last?.msg) log(`bg: ${last.msg}`);
+    }
+
     if (j.ready) {
       setStatus("ready");
       setOutputReady(true);
       log("Direct job finished. CSV is ready to download.");
       stopPolling();
-    } else if (j.status === "failed" || j.error) {
-      setStatus("failed");
-      setOutputReady(false);
-      setError(j.error || "Direct job failed.");
-      log(`Direct job failed: ${j.error || "(unknown error)"}`);
-      stopPolling();
     } else {
       setStatus(j.status || "running");
-      log(`Direct job status: ${j.status || "running"}`);
     }
   } catch (err) {
     log(`Direct status error: ${err?.message || String(err)}`);
   }
 }
+
+function startPollingDirect(id) {
+  stopPolling();
+  pollRef.current = setInterval(() => checkDirectStatus(id), 3000);
+}
+
 
 
 function startPollingDirect(id) {
