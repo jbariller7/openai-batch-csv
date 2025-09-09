@@ -166,6 +166,19 @@ let parsed = null; try { parsed = JSON.parse(resp.output_text || ""); } catch {}
 parts[my] = parsed;
 completedChunks++;
 const processedRows = Math.min(completedChunks * chunkSize, items.length);
+// NEW: persist a partial file for this chunk
+await store.set(
+  `partials/${jobId}/${my}.json`,
+  JSON.stringify(parsed || {}),
+  { contentType: "application/json" }
+);
+
+// Update status (keeps tail logs, counts, and marks partial availability)
+await writeStatus(
+  "running",
+  { completedChunks, totalChunks, processedRows, partial: true },
+  `chunk#${my + 1} done (${chunks[my].length} rows) → ${completedChunks}/${totalChunks}`
+);
 
         // update every chunk (small jobs) or every 3 (bigger)
         if (totalChunks <= 50 || completedChunks % 3 === 0 || completedChunks === totalChunks) {
