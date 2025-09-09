@@ -40,18 +40,24 @@ export default async (reqOrEvent) => {
   try {
     const store = getStore("openai-batch-csv");
 
-    // ----- NEW: direct-mode download path -----
-    const directCsvBuf = await store.get(`results/${id}.csv`, { type: "buffer" });
-    if (directCsvBuf) {
-      return new Response(directCsvBuf, {
-        status: 200,
-        headers: {
-          ...CORS,
-          "Content-Type": "text/csv",
-          "Content-Disposition": `attachment; filename="${id}.csv"`,
-        },
-      });
-    }
+// ----- NEW: direct-mode download path -----
+let directCsvText = null;
+try {
+  directCsvText = await store.get(`results/${id}.csv`, { type: "text" });
+} catch (_) {
+  directCsvText = null;
+}
+if (typeof directCsvText === "string") {
+  return new Response(directCsvText, {
+    status: 200,
+    headers: {
+      ...CORS,
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${id}.csv"`,
+    },
+  });
+}
+
 
     // ----- Existing batch download path -----
     const b = await client.batches.retrieve(id);
