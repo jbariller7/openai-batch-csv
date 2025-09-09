@@ -8,12 +8,11 @@ import { stringify as csvStringify } from "csv-stringify";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Optional: cap concurrency via env
-const MAX_DIRECT_CONCURRENCY = Number(process.env.MAX_DIRECT_CONCURRENCY || 8);
-// Some models (gpt-5 family) don't support temperature
-const supportsTemperature = (name) => !/^gpt-5(\b|[-_])/.test(name);
-
 export const config = { /* path: "/api/direct-worker-background" */ };
+
+// limits/compat
+const MAX_DIRECT_CONCURRENCY = Number(process.env.MAX_DIRECT_CONCURRENCY || 8);
+const supportsTemperature = (name) => !/^gpt-5(\b|[-_])/.test(name);
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -25,13 +24,34 @@ function json(body, status = 200) {
 export default async function handler(req) {
   if (req.method !== "POST") return json({ error: "POST only" }, 405);
 
+  let jobId = "";
+  let store = null;
+
+  // small helper to persist status
+  async function writeStatus(status, extra = {}) {
+    if (!store || !jobId) return;
+    const payload = {
+      jobId,
+      status,                 // "queued" | "running" | "ready" | "failed"
+      updatedAt: new Date().toISOString(),
+      ...extra,
+    };
+    try { await store.setJSON(`jobs/${jobId}.status.json`, payload); } catch {}
+  }
+
   try {
-    const { jobId } = await req.json();
+    const body = await req.json().catch(() => ({}));
+    jobId = body?.jobId || "";
     if (!jobId) return json({ error: "Missing jobId" }, 400);
 
-    const store = getStore("openai-batch-csv");
+    store = getStore("openai-batch-csv");
+    await writeStatus("running");
+
     const meta = await store.getJSON(`jobs/${jobId}.json`);
-    if (!meta) return json({ error: "Job metadata not found" }, 404);
+    if (!meta) {
+      await writeStatus("failed", { error: "Job metadata not found" });
+      return json({ error: "Job metadata not found" }, 404);
+    }
 
     const {
       model,
@@ -39,14 +59,18 @@ export default async function handler(req) {
       inputCol = "text",
       chunkSize = 200,
       reasoningEffort = "",
+      concurrency: desiredConcurrency = 4,
     } = meta;
 
     const supportsReasoning =
       /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
 
     // Read original CSV
-    const csvBuf = await store.get(`csv/${jobId}.csv`, { type: "buffer" });
-    if (!csvBuf) return json({ error: "Original CSV not found" }, 404);
+    const csvBuf = await store.get(`csv/${jobId}.csv`, { type: "buffer" }).catch(() => null);
+    if (!csvBuf) {
+      await writeStatus("failed", { error: "Original CSV not found" });
+      return json({ error: "Original CSV not found" }, 404);
+    }
 
     const rows = await new Promise((resolve, reject) => {
       const out = [];
@@ -82,7 +106,7 @@ export default async function handler(req) {
     const chunks = [];
     for (let i = 0; i < items.length; i += chunkSize) chunks.push(items.slice(i, i + chunkSize));
 
-    // Simple retry with backoff (helps if you raise concurrency)
+    // Retry helper
     async function callWithRetry(fn, { retries = 5, base = 300, max = 5000 } = {}) {
       let attempt = 0;
       for (;;) {
@@ -99,7 +123,7 @@ export default async function handler(req) {
       }
     }
 
-    const concurrency = Math.max(1, Math.min(MAX_DIRECT_CONCURRENCY, Number(meta.concurrency || 4)));
+    const concurrency = Math.max(1, Math.min(MAX_DIRECT_CONCURRENCY, Number(desiredConcurrency || 4)));
     let i = 0;
     const parts = new Array(chunks.length);
 
@@ -121,12 +145,15 @@ export default async function handler(req) {
       for (const item of part.results) {
         const idx = Number(item?.id);
         if (Number.isFinite(idx) && idx >= 0 && idx < mergedRows.length) {
-          mergedRows[idx].result = typeof item?.result === "string" ? item.result : (item?.result != null ? String(item.result) : "");
+          mergedRows[idx].result =
+            typeof item?.result === "string"
+              ? item.result
+              : (item?.result != null ? String(item.result) : "");
         }
       }
     }
 
-    // Write CSV
+    // Write CSV + status
     const headers = Object.keys(mergedRows[0] || {});
     const csvStr = await new Promise((resolve, reject) => {
       csvStringify(mergedRows, { header: true, columns: headers }, (err, out) => {
@@ -136,12 +163,20 @@ export default async function handler(req) {
     });
 
     await store.set(`results/${jobId}.csv`, csvStr, { contentType: "text/csv; charset=utf-8" });
-    await store.setJSON(`jobs/${jobId}.status.json`, { jobId, status: "ready", finishedAt: new Date().toISOString() });
+    await writeStatus("ready", { finishedAt: new Date().toISOString() });
 
-    // Background functions return immediately anyway
     return json({ ok: true, jobId, rows: rows.length }, 202);
   } catch (err) {
     console.error("direct-worker-background error:", err);
+    try {
+      await (store || getStore("openai-batch-csv"))
+        .setJSON(`jobs/${jobId}.status.json`, {
+          jobId,
+          status: "failed",
+          error: err?.message || String(err),
+          updatedAt: new Date().toISOString(),
+        });
+    } catch {}
     return json({ error: err?.message || String(err) }, 500);
   }
 }
