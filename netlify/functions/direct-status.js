@@ -46,6 +46,8 @@ exports.handler = async function (event) {
       updatedAt: statusJson?.updatedAt || null,
       // last few worker messages
       events: Array.isArray(statusJson?.events) ? statusJson.events.slice(-10) : [],
+      partial: !!statusJson?.partial,
+
     });
   } catch (e) {
     return res(500, { error: e?.message || String(e) });
