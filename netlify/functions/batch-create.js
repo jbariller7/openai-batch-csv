@@ -107,7 +107,11 @@ exports.handler = async function (event) {
 
     // Store original CSV
     const jobId = crypto.randomUUID();
-    const store = getStore("openai-batch-csv");
+    const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
+const token  = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
+const store  = (siteID && token)
+  ? getStore({ name: "openai-batch-csv", siteID, token })
+  : getStore("openai-batch-csv");
     await store.set(`csv/${jobId}.csv`, fileBuffer, { contentType: "text/csv; charset=utf-8" });
 
     // Parse CSV
