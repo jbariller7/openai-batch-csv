@@ -1,12 +1,9 @@
-// netlify/functions/direct-worker-background.js  (CommonJS)
-const { getStore } = require("@netlify/blobs");
+// netlify/functions/direct-worker-background.js  (CommonJS + dynamic import for ESM deps)
+
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
 
-// OpenAI SDK default export in CJS:
-const OpenAI = require("openai");
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
+// limits/compat
 const MAX_DIRECT_CONCURRENCY = Number(process.env.MAX_DIRECT_CONCURRENCY || 8);
 const supportsTemperature = (name) => !/^gpt-5(\b|[-_])/.test(name);
 
@@ -19,17 +16,32 @@ function json(body, status = 200) {
   });
 }
 
-exports.handler = async function(req) {
+exports.handler = async function (req) {
   if (req.method !== "POST") return json({ error: "POST only" }, 405);
 
-  let jobId = "";
-  let store = null;
+  // Dynamically import ESM modules inside the handler
+  const { getStore } = await import("@netlify/blobs");
+  const { default: OpenAI } = await import("openai");
+  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+  let jobId = "";
+  const store = getStore("openai-batch-csv");
+
+  // helper to persist status in Blobs (CJS-friendly)
   async function writeStatus(status, extra = {}) {
-    if (!store || !jobId) return;
-    const payload = { jobId, status, updatedAt: new Date().toISOString(), ...extra };
+    if (!jobId) return;
+    const payload = {
+      jobId,
+      status, // "queued" | "running" | "ready" | "failed"
+      updatedAt: new Date().toISOString(),
+      ...extra,
+    };
     try {
-      await store.set(`jobs/${jobId}.status.json`, JSON.stringify(payload), { contentType: "application/json" });
+      await store.set(
+        `jobs/${jobId}.status.json`,
+        JSON.stringify(payload),
+        { contentType: "application/json" }
+      );
     } catch {}
   }
 
@@ -38,10 +50,10 @@ exports.handler = async function(req) {
     jobId = body?.jobId || "";
     if (!jobId) return json({ error: "Missing jobId" }, 400);
 
-    store = getStore("openai-batch-csv");
     await writeStatus("running");
 
-    const meta = await store.get(`jobs/${jobId}.json`, { type: "json" });
+    // Read metadata (saved by batch-create.js)
+    const meta = await store.get(`jobs/${jobId}.json`, { type: "json" }).catch(() => null);
     if (!meta) {
       await writeStatus("failed", { error: "Job metadata not found" });
       return json({ error: "Job metadata not found" }, 404);
@@ -59,6 +71,7 @@ exports.handler = async function(req) {
     const supportsReasoning =
       /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
 
+    // Read original CSV (as text for Blobs compatibility)
     const csvTxt = await store.get(`csv/${jobId}.csv`, { type: "text" }).catch(() => null);
     if (!csvTxt) {
       await writeStatus("failed", { error: "Original CSV not found" });
@@ -96,6 +109,11 @@ exports.handler = async function(req) {
       return body;
     }
 
+    // Chunk
+    const chunks = [];
+    for (let i = 0; i < items.length; i += chunkSize) chunks.push(items.slice(i, i + chunkSize));
+
+    // Retry helper for rate limits/transient errors
     async function callWithRetry(fn, { retries = 5, base = 300, max = 5000 } = {}) {
       let attempt = 0;
       for (;;) {
@@ -113,9 +131,6 @@ exports.handler = async function(req) {
     }
 
     const concurrency = Math.max(1, Math.min(MAX_DIRECT_CONCURRENCY, Number(desiredConcurrency || 4)));
-    const chunks = [];
-    for (let i = 0; i < items.length; i += chunkSize) chunks.push(items.slice(i, i + chunkSize));
-
     let i = 0;
     const parts = new Array(chunks.length);
 
@@ -130,6 +145,7 @@ exports.handler = async function(req) {
     }
     await Promise.all(Array.from({ length: concurrency }, worker));
 
+    // Merge results
     const mergedRows = rows.map((r) => ({ ...r, result: "" }));
     for (const part of parts) {
       if (!part?.results) continue;
@@ -144,6 +160,7 @@ exports.handler = async function(req) {
       }
     }
 
+    // Write CSV + status
     const headers = Object.keys(mergedRows[0] || {});
     const csvStr = await new Promise((resolve, reject) => {
       csvStringify(mergedRows, { header: true, columns: headers }, (err, out) => {
@@ -159,8 +176,7 @@ exports.handler = async function(req) {
   } catch (err) {
     console.error("direct-worker-background error:", err);
     try {
-      const s = store || getStore("openai-batch-csv");
-      await s.set(
+      await store.set(
         `jobs/${jobId}.status.json`,
         JSON.stringify({
           jobId,
