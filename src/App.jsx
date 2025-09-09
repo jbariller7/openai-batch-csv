@@ -22,6 +22,7 @@ export default function App() {
   const [batchId, setBatchId] = useState("");
   const [status, setStatus] = useState("");
   const [outputReady, setOutputReady] = useState(false);
+  const [downloadUrl, setDownloadUrl] = useState("");
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -50,7 +51,7 @@ export default function App() {
   async function submitBatch(e) {
     e.preventDefault();
     setError(""); setOutputReady(false); setStatus("");
-    setPreview(null);
+    setPreview(null); setDownloadUrl("");
     setLastRunMode(mode);
 
     if (!file) { setError("Please choose a CSV file."); log("No file selected."); return; }
@@ -58,7 +59,7 @@ export default function App() {
     try {
       setIsSubmitting(true);
       stopPolling();
-      setBatchId(""); // reset any previous batch
+      setBatchId(""); // reset any previous job id
 
       log(`Preparing form…`);
       log(`File: ${file.name} (${file.size.toLocaleString()} bytes)`);
@@ -104,17 +105,24 @@ export default function App() {
       let j = {}; try { j = JSON.parse(bodyText || "{}"); } catch {}
       const returnedMode = j.mode || mode;
 
-      // Handle non-batch paths (dry/direct): show preview and stop here
-      if (returnedMode === "dryRun" || returnedMode === "direct") {
+      // Handle DRY RUN (preview only)
+      if (returnedMode === "dryRun") {
         setBatchId("");
         setStatus("done");
-        // Prefer structured fields if available
         setPreview(j.parsed || j.results || j);
-        log(
-          returnedMode === "dryRun"
-            ? `Dry run OK. Used rows: ${j.usedRows ?? "?"}. Preview ready below.`
-            : `Direct run OK. Processed rows: ${j.rowCount ?? "?"}. Preview ready below.`
-        );
+        log(`Dry run OK. Used rows: ${j.usedRows ?? "?"}. Preview ready below.`);
+        return;
+      }
+
+      // Handle DIRECT (CSV ready now)
+      if (returnedMode === "direct") {
+        const id = j.jobId || "";
+        setBatchId(id);                   // <- show the panel & reuse download button
+        setStatus("ready");
+        setOutputReady(true);             // <- enable the button
+        setPreview(j.results || null);    // optional preview if you want it elsewhere
+        setDownloadUrl(j.download || `${API_BASE}/batch-download?id=${encodeURIComponent(id)}`);
+        log(`Direct run OK. Processed rows: ${j.rowCount ?? "?"}. CSV is ready to download.`);
         return;
       }
 
@@ -158,7 +166,9 @@ export default function App() {
   function downloadOutput() {
     if (!batchId) return;
     log("Downloading merged CSV…");
-    window.location.href = `${API_BASE}/batch-download?id=${encodeURIComponent(batchId)}`;
+    // Works for BOTH: batch id or direct job id
+    const url = downloadUrl || `${API_BASE}/batch-download?id=${encodeURIComponent(batchId)}`;
+    window.location.href = url;
   }
 
   function clearLogs() { setLogs([]); }
@@ -270,24 +280,27 @@ export default function App() {
         </button>
       </form>
 
-      {/* Batch status panel */}
+      {/* Job panel (works for Batch AND Direct) */}
       {batchId && (
         <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
-          <div><strong>Batch ID:</strong> {batchId}</div>
+          <div><strong>Job ID:</strong> {batchId}</div>
           <div><strong>Status:</strong> {status || "(unknown)"} </div>
           <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-            <button onClick={checkStatus}>Refresh Status</button>
+            {lastRunMode === "batch" && <button onClick={checkStatus}>Refresh Status</button>}
             <button onClick={downloadOutput} disabled={!outputReady}>Download merged CSV</button>
+            {lastRunMode === "direct" && downloadUrl && (
+              <a href={downloadUrl} style={{ alignSelf: "center" }}>Open link</a>
+            )}
           </div>
           {error && <p style={{ color: "crimson", marginTop: 8 }}>{error}</p>}
         </div>
       )}
 
-      {/* Dry/Direct preview panel */}
-      {!batchId && preview && (
+      {/* Dry preview panel */}
+      {!batchId && preview && lastRunMode === "dry" && (
         <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
           <div style={{ marginBottom: 6 }}>
-            <strong>Preview</strong> ({lastRunMode === "dry" ? "Dry run (first chunk)" : "Direct (all rows)"})
+            <strong>Preview</strong> (Dry run: first chunk only)
           </div>
           <pre style={{
             background: "#0b1020", color: "#d7e3ff", padding: 12, borderRadius: 8,
