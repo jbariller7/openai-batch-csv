@@ -1,9 +1,8 @@
-// netlify/functions/direct-status.js
-import { getStore } from "@netlify/blobs";
+// netlify/functions/direct-status.js  (CommonJS)
 
-export const config = { /* path: "/api/direct-status" */ };
+exports.config = { /* path: "/api/direct-status" */ };
 
-export default async function handler(req) {
+exports.handler = async function (req) {
   const url = new URL(req.url);
   const id = url.searchParams.get("id");
   if (!id) {
@@ -13,19 +12,15 @@ export default async function handler(req) {
     });
   }
 
+  const { getStore } = await import("@netlify/blobs");
+  const store = getStore("openai-batch-csv");
+
   try {
-    const store = getStore("openai-batch-csv");
+    let statusJson = null;
+    try {
+      statusJson = await store.get(`jobs/${id}.status.json`, { type: "json" });
+    } catch {}
 
-    // Prefer explicit status if present
-   let statusJson = null;
-try {
-  statusJson = await store.get(`jobs/${id}.status.json`, { type: "json" });
-} catch (_) {
-  statusJson = null;
-}
-
-
-    // If no status JSON yet, consider CSV existence as readiness
     let csvExists = false;
     if (!statusJson || statusJson.status !== "ready") {
       try {
@@ -48,4 +43,4 @@ try {
       headers: { "Content-Type": "application/json" },
     });
   }
-}
+};
