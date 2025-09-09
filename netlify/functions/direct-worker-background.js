@@ -1,18 +1,16 @@
-// netlify/functions/direct-worker-background.js
-// Background Function: processes a Direct job and writes results/{jobId}.csv
+// netlify/functions/direct-worker-background.js  (CommonJS)
+const { getStore } = require("@netlify/blobs");
+const { parse: csvParse } = require("csv-parse");
+const { stringify: csvStringify } = require("csv-stringify");
 
-import OpenAI from "openai";
-import { getStore } from "@netlify/blobs";
-import { parse as csvParse } from "csv-parse";
-import { stringify as csvStringify } from "csv-stringify";
-
+// OpenAI SDK default export in CJS:
+const OpenAI = require("openai");
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-export const config = { /* path: "/api/direct-worker-background" */ };
-
-// limits/compat
 const MAX_DIRECT_CONCURRENCY = Number(process.env.MAX_DIRECT_CONCURRENCY || 8);
 const supportsTemperature = (name) => !/^gpt-5(\b|[-_])/.test(name);
+
+exports.config = { /* path: "/api/direct-worker-background" */ };
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -21,27 +19,18 @@ function json(body, status = 200) {
   });
 }
 
-export default async function handler(req) {
+exports.handler = async function(req) {
   if (req.method !== "POST") return json({ error: "POST only" }, 405);
 
   let jobId = "";
   let store = null;
 
-  // small helper to persist status
   async function writeStatus(status, extra = {}) {
     if (!store || !jobId) return;
-    const payload = {
-      jobId,
-      status,                 // "queued" | "running" | "ready" | "failed"
-      updatedAt: new Date().toISOString(),
-      ...extra,
-    };
-    try { await store.set(
-  `jobs/${jobId}.status.json`,
-  JSON.stringify(payload),
-  { contentType: "application/json" }
-);
- } catch {}
+    const payload = { jobId, status, updatedAt: new Date().toISOString(), ...extra };
+    try {
+      await store.set(`jobs/${jobId}.status.json`, JSON.stringify(payload), { contentType: "application/json" });
+    } catch {}
   }
 
   try {
@@ -53,7 +42,6 @@ export default async function handler(req) {
     await writeStatus("running");
 
     const meta = await store.get(`jobs/${jobId}.json`, { type: "json" });
-
     if (!meta) {
       await writeStatus("failed", { error: "Job metadata not found" });
       return json({ error: "Job metadata not found" }, 404);
@@ -71,9 +59,8 @@ export default async function handler(req) {
     const supportsReasoning =
       /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
 
-    // Read original CSV
     const csvTxt = await store.get(`csv/${jobId}.csv`, { type: "text" }).catch(() => null);
-    if (! csvTxt) {
+    if (!csvTxt) {
       await writeStatus("failed", { error: "Original CSV not found" });
       return json({ error: "Original CSV not found" }, 404);
     }
@@ -81,7 +68,6 @@ export default async function handler(req) {
     const rows = await new Promise((resolve, reject) => {
       const out = [];
       csvParse(csvTxt, { columns: true, relax_quotes: true, bom: true, skip_empty_lines: true })
-
         .on("data", (r) => out.push(r))
         .on("end", () => resolve(out))
         .on("error", reject);
@@ -96,7 +82,7 @@ export default async function handler(req) {
       + ' in the SAME ORDER as input. Do not include any commentary.';
 
     function buildBody(rowsChunk) {
-      return {
+      const body = {
         model,
         input: [
           { role: "system", content: `${prompt}${suffix}` },
@@ -104,16 +90,12 @@ export default async function handler(req) {
           { role: "user", content: JSON.stringify({ rows: rowsChunk }) }
         ],
         text: { format: { type: "json_object" } },
-        ...(supportsTemperature(model) ? { temperature: 0 } : {}),
-        ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
       };
+      if (supportsTemperature(model)) body.temperature = 0;
+      if (supportsReasoning && reasoningEffort) body.reasoning = { effort: reasoningEffort };
+      return body;
     }
 
-    // Chunk the work
-    const chunks = [];
-    for (let i = 0; i < items.length; i += chunkSize) chunks.push(items.slice(i, i + chunkSize));
-
-    // Retry helper
     async function callWithRetry(fn, { retries = 5, base = 300, max = 5000 } = {}) {
       let attempt = 0;
       for (;;) {
@@ -131,6 +113,9 @@ export default async function handler(req) {
     }
 
     const concurrency = Math.max(1, Math.min(MAX_DIRECT_CONCURRENCY, Number(desiredConcurrency || 4)));
+    const chunks = [];
+    for (let i = 0; i < items.length; i += chunkSize) chunks.push(items.slice(i, i + chunkSize));
+
     let i = 0;
     const parts = new Array(chunks.length);
 
@@ -145,7 +130,6 @@ export default async function handler(req) {
     }
     await Promise.all(Array.from({ length: concurrency }, worker));
 
-    // Merge results
     const mergedRows = rows.map((r) => ({ ...r, result: "" }));
     for (const part of parts) {
       if (!part?.results) continue;
@@ -160,7 +144,6 @@ export default async function handler(req) {
       }
     }
 
-    // Write CSV + status
     const headers = Object.keys(mergedRows[0] || {});
     const csvStr = await new Promise((resolve, reject) => {
       csvStringify(mergedRows, { header: true, columns: headers }, (err, out) => {
@@ -176,19 +159,18 @@ export default async function handler(req) {
   } catch (err) {
     console.error("direct-worker-background error:", err);
     try {
-const s = store || getStore("openai-batch-csv");
-await s.set(
-  `jobs/${jobId}.status.json`,
-  JSON.stringify({
-    jobId,
-    status: "failed",
-    error: err?.message || String(err),
-    updatedAt: new Date().toISOString(),
-  }),
-  { contentType: "application/json" }
-);
-
+      const s = store || getStore("openai-batch-csv");
+      await s.set(
+        `jobs/${jobId}.status.json`,
+        JSON.stringify({
+          jobId,
+          status: "failed",
+          error: err?.message || String(err),
+          updatedAt: new Date().toISOString(),
+        }),
+        { contentType: "application/json" }
+      );
     } catch {}
     return json({ error: err?.message || String(err) }, 500);
   }
-}
+};
