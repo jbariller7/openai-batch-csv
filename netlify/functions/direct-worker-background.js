@@ -1,4 +1,4 @@
-// netlify/functions/direct-worker-background.js  (CommonJS + dynamic import)
+// netlify/functions/direct-worker-background.js  (CommonJS + Lambda-style returns)
 
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
@@ -8,17 +8,30 @@ exports.config = { /* path: "/api/direct-worker-background" */ };
 const MAX_DIRECT_CONCURRENCY = Number(process.env.MAX_DIRECT_CONCURRENCY || 8);
 const supportsTemperature = (name) => !/^gpt-5(\b|[-_])/.test(name);
 
-function json(body, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
+// helpers
+function res(statusCode, bodyObj, extraHeaders) {
+  return {
+    statusCode,
+    headers: { "Content-Type": "application/json", ...(extraHeaders || {}) },
+    body: JSON.stringify(bodyObj ?? {}),
+  };
+}
+async function readJson(event) {
+  // Works for both Web Request and Lambda event
+  if (event && typeof event.json === "function") {
+    try { return await event.json(); } catch {}
+  }
+  const b64 = !!event?.isBase64Encoded;
+  const raw = event?.body || "";
+  if (!raw) return {};
+  try {
+    const txt = b64 ? Buffer.from(raw, "base64").toString("utf8") : raw;
+    return JSON.parse(txt);
+  } catch { return {}; }
 }
 
-exports.handler = async function (req) {
-  if (req.method !== "POST") return json({ error: "POST only" }, 405);
-
-  // ESM deps
+exports.handler = async function (event) {
+  // ESM-only deps: load dynamically inside the handler (Node 18 supports this)
   const { getStore } = await import("@netlify/blobs");
   const { default: OpenAI } = await import("openai");
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -30,30 +43,42 @@ exports.handler = async function (req) {
     if (!jobId) return;
     const payload = { jobId, status, updatedAt: new Date().toISOString(), ...extra };
     try {
-      await store.set(`jobs/${jobId}.status.json`, JSON.stringify(payload), { contentType: "application/json" });
+      await store.set(`jobs/${jobId}.status.json`, JSON.stringify(payload), {
+        contentType: "application/json",
+      });
     } catch {}
   }
 
   try {
-    const body = await req.json().catch(() => ({}));
+    const body = await readJson(event);
     jobId = body?.jobId || "";
-    if (!jobId) return json({ error: "Missing jobId" }, 400);
+    if (!jobId) return res(400, { error: "Missing jobId" });
 
     await writeStatus("running");
 
     const meta = await store.get(`jobs/${jobId}.json`, { type: "json" }).catch(() => null);
     if (!meta) {
       await writeStatus("failed", { error: "Job metadata not found" });
-      return json({ error: "Job metadata not found" }, 404);
+      return res(404, { error: "Job metadata not found" });
     }
 
-    const { model, prompt, inputCol = "text", chunkSize = 200, reasoningEffort = "", concurrency: desiredConcurrency = 4 } = meta;
-    const supportsReasoning = /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
+    const {
+      model,
+      prompt,
+      inputCol = "text",
+      chunkSize = 200,
+      reasoningEffort = "",
+      concurrency: desiredConcurrency = 4,
+    } = meta;
 
+    const supportsReasoning =
+      /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
+
+    // Read original CSV (as text)
     const csvTxt = await store.get(`csv/${jobId}.csv`, { type: "text" }).catch(() => null);
     if (!csvTxt) {
       await writeStatus("failed", { error: "Original CSV not found" });
-      return json({ error: "Original CSV not found" }, 404);
+      return res(404, { error: "Original CSV not found" });
     }
 
     const rows = await new Promise((resolve, reject) => {
@@ -87,10 +112,11 @@ exports.handler = async function (req) {
       return body;
     }
 
-    // chunk
+    // Chunk the work
     const chunks = [];
     for (let i = 0; i < items.length; i += chunkSize) chunks.push(items.slice(i, i + chunkSize));
 
+    // Retry helper
     async function callWithRetry(fn, { retries = 5, base = 300, max = 5000 } = {}) {
       let attempt = 0;
       for (;;) {
@@ -121,7 +147,7 @@ exports.handler = async function (req) {
     }
     await Promise.all(Array.from({ length: concurrency }, worker));
 
-    // Merge results
+    // Merge results to CSV
     const mergedRows = rows.map((r) => ({ ...r, result: "" }));
     for (const part of parts) {
       if (!part?.results) continue;
@@ -135,7 +161,6 @@ exports.handler = async function (req) {
       }
     }
 
-    // Write CSV + status
     const headers = Object.keys(mergedRows[0] || {});
     const csvStr = await new Promise((resolve, reject) => {
       csvStringify(mergedRows, { header: true, columns: headers }, (err, out) => {
@@ -147,11 +172,12 @@ exports.handler = async function (req) {
     await store.set(`results/${jobId}.csv`, csvStr, { contentType: "text/csv; charset=utf-8" });
     await writeStatus("ready", { finishedAt: new Date().toISOString() });
 
-    return json({ ok: true, jobId, rows: rows.length }, 202);
+    // Background functions should return quickly; 202 Accepted is fine
+    return res(202, { ok: true, jobId, rows: rows.length });
   } catch (err) {
     console.error("direct-worker-background error:", err);
     try {
-      await (await import("@netlify/blobs")).getStore("openai-batch-csv").set(
+      await store.set(
         `jobs/${jobId}.status.json`,
         JSON.stringify({
           jobId,
@@ -162,6 +188,6 @@ exports.handler = async function (req) {
         { contentType: "application/json" }
       );
     } catch {}
-    return json({ error: err?.message || String(err) }, 500);
+    return res(500, { error: err?.message || String(err) });
   }
 };
