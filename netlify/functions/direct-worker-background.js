@@ -24,7 +24,11 @@ exports.handler = async function (event) {
   const { getStore } = await import("@netlify/blobs");
   const { default: OpenAI } = await import("openai");
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  const store = getStore("openai-batch-csv");
+  const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
+const token  = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
+const store  = (siteID && token)
+  ? getStore({ name: "openai-batch-csv", siteID, token })
+  : getStore("openai-batch-csv");
 
   let jobId = "";
 
