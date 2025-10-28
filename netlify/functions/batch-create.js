@@ -1,5 +1,7 @@
-// netlify/functions/batch-create.js (CommonJS + Lambda-style returns)
+// netlify/functions/batch-create.js
+// CommonJS + Lambda-style returns
 
+const { randomUUID } = require("node:crypto");
 const Busboy = require("busboy");
 const { parse: csvParse } = require("csv-parse");
 
@@ -106,12 +108,12 @@ exports.handler = async function (event) {
     }
 
     // Store original CSV
-    const jobId = crypto.randomUUID();
+    const jobId = randomUUID();
     const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
-const token  = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
-const store  = (siteID && token)
-  ? getStore({ name: "openai-batch-csv", siteID, token })
-  : getStore("openai-batch-csv");
+    const token  = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
+    const store  = (siteID && token)
+      ? getStore({ name: "openai-batch-csv", siteID, token })
+      : getStore("openai-batch-csv");
     await store.set(`csv/${jobId}.csv`, fileBuffer, { contentType: "text/csv; charset=utf-8" });
 
     // Parse CSV
@@ -129,10 +131,10 @@ const store  = (siteID && token)
       /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
 
     const suffix =
-      ' You will receive a json object {"rows":[{"id":number,"text":string},...]}.'
-      + ' For each item, produce {"id": same id, "result": <string>} following the user instructions above.'
-      + ' The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]}'
-      + ' in the SAME ORDER as input. Do not include any commentary.';
+      ' You will receive a json object {"rows":[{"id":number,"text":string},...]}.' +
+      ' For each item, produce {"id": same id, "result": <string>} following the user instructions above.' +
+      ' The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]}' +
+      ' in the SAME ORDER as input. Do not include any commentary.';
 
     // DRY RUN
     if (dryRun) {
@@ -156,114 +158,113 @@ const store  = (siteID && token)
       return res(200, { mode: "dryRun", jobId, usedRows: firstChunk.length, model, response: resp, parsed });
     }
 
- // ---- DIRECT: kick off the background worker and return 202 (or 500 on invoke failure)
-if (direct) {
-  // Persist metadata for the worker
-  await store.set(
-    `jobs/${jobId}.json`,
-    JSON.stringify({
-      jobId,
-      model,
-      prompt,
-      inputCol,
-      chunkSize,
-      reasoningEffort,
-      concurrency,
-      createdAt: new Date().toISOString(),
-    }),
-    { contentType: "application/json" }
-  );
+    // ---- DIRECT: kick off the background worker and return 202 (or 500 on invoke failure)
+    if (direct) {
+      // Persist metadata for the worker
+      await store.set(
+        `jobs/${jobId}.json`,
+        JSON.stringify({
+          jobId,
+          model,
+          prompt,
+          inputCol,
+          chunkSize,
+          reasoningEffort,
+          concurrency,
+          createdAt: new Date().toISOString(),
+        }),
+        { contentType: "application/json" }
+      );
 
-  // Seed an initial status so the UI shows progress immediately
-  const now = new Date().toISOString();
-  await store.set(
-    `jobs/${jobId}.status.json`,
-    JSON.stringify({
-      jobId,
-      status: "queued",
-      updatedAt: now,
-      events: [{ ts: now, msg: "queued" }],
-    }),
-    { contentType: "application/json" }
-  );
-
-  // ---- BUILD ORIGIN FROM INCOMING REQUEST HEADERS (works in prod & netlify dev)
-  const hdrs = event.headers || {};
-
-  const host =
-    hdrs["x-forwarded-host"] ||
-    hdrs["host"] ||
-    hdrs["Host"] ||
-    "";
-  const proto =
-    hdrs["x-forwarded-proto"] ||
-    (host.startsWith("localhost") || host.startsWith("127.0.0.1") ? "http" : "https");
-  const origin =
-    host
-      ? `${proto}://${host}`
-      : (process.env.NETLIFY_SITE_URL || process.env.URL || process.env.DEPLOY_URL || "http://localhost:8888");
-
-  // Try to invoke the background worker; if it fails, mark job failed and bubble up
-  try {
-    const wr = await fetch(`${origin}/.netlify/functions/direct-worker-background`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jobId }),
-    });
-
-    if (!wr.ok) {
-      const msg = `worker invoke failed: HTTP ${wr.status}`;
+      // Seed an initial status so the UI shows progress immediately
+      const now = new Date().toISOString();
       await store.set(
         `jobs/${jobId}.status.json`,
         JSON.stringify({
           jobId,
-          status: "failed",
-          updatedAt: new Date().toISOString(),
-          events: [{ ts: new Date().toISOString(), msg: msg }],
-          error: msg,
+          status: "queued",
+          updatedAt: now,
+          events: [{ ts: now, msg: "queued" }],
         }),
         { contentType: "application/json" }
       );
+
+      // ---- BUILD ORIGIN FROM INCOMING REQUEST HEADERS (works in prod & netlify dev)
+      const hdrs = event.headers || {};
+
+      const host =
+        hdrs["x-forwarded-host"] ||
+        hdrs["host"] ||
+        hdrs["Host"] ||
+        "";
+      const proto =
+        hdrs["x-forwarded-proto"] ||
+        (host.startsWith("localhost") || host.startsWith("127.0.0.1") ? "http" : "https");
+      const origin =
+        host
+          ? `${proto}://${host}`
+          : (process.env.NETLIFY_SITE_URL || process.env.URL || process.env.DEPLOY_URL || "http://localhost:8888");
+
+      // Try to invoke the background worker; if it fails, mark job failed and bubble up
+      try {
+        const wr = await fetch(`${origin}/.netlify/functions/direct-worker-background`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jobId }),
+        });
+
+        if (!wr.ok) {
+          const msg = `worker invoke failed: HTTP ${wr.status}`;
+          await store.set(
+            `jobs/${jobId}.status.json`,
+            JSON.stringify({
+              jobId,
+              status: "failed",
+              updatedAt: new Date().toISOString(),
+              events: [{ ts: new Date().toISOString(), msg: msg }],
+              error: msg,
+            }),
+            { contentType: "application/json" }
+          );
+          return {
+            statusCode: 500,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ error: msg }),
+          };
+        }
+      } catch (e) {
+        const msg = `worker invoke error: ${e?.message || String(e)}`;
+        await store.set(
+          `jobs/${jobId}.status.json`,
+          JSON.stringify({
+            jobId,
+            status: "failed",
+            updatedAt: new Date().toISOString(),
+            events: [{ ts: new Date().toISOString(), msg: msg }],
+            error: msg,
+          }),
+          { contentType: "application/json" }
+        );
+        return {
+          statusCode: 500,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ error: msg }),
+        };
+      }
+
+      // Tell the UI how to poll + where to download once ready
       return {
-        statusCode: 500,
+        statusCode: 202,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ error: msg }),
+        body: JSON.stringify({
+          mode: "direct",
+          jobId,
+          model,
+          rowCount: effectiveRows.length,
+          download: `/.netlify/functions/batch-download?id=${jobId}`,
+        }),
       };
     }
-  } catch (e) {
-    const msg = `worker invoke error: ${e?.message || String(e)}`;
-    await store.set(
-      `jobs/${jobId}.status.json`,
-      JSON.stringify({
-        jobId,
-        status: "failed",
-        updatedAt: new Date().toISOString(),
-        events: [{ ts: new Date().toISOString(), msg: msg }],
-        error: msg,
-      }),
-      { contentType: "application/json" }
-    );
-    return {
-      statusCode: 500,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ error: msg }),
-    };
-  }
-
-  // Tell the UI how to poll + where to download once ready
-  return {
-    statusCode: 202,
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      mode: "direct",
-      jobId,
-      model,
-      rowCount: effectiveRows.length,
-      download: `/.netlify/functions/batch-download?id=${jobId}`,
-    }),
-  };
-}
-
 
     // BATCH
     const lines = [];
