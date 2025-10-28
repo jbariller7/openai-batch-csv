@@ -1,5 +1,5 @@
 // netlify/functions/direct-worker-background.js
-// CommonJS + Lambda-style + detailed logs + partials + multi-column merge + UTF-8 BOM
+// CommonJS + Lambda-style + resumable processing + monotonic status + lock
 
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
@@ -7,6 +7,9 @@ const { stringify: csvStringify } = require("csv-stringify");
 exports.config = { /* path: "/api/direct-worker-background" */ };
 
 const MAX_DIRECT_CONCURRENCY = Number(process.env.MAX_DIRECT_CONCURRENCY || 8);
+const LOCK_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const LOCK_HEARTBEAT_MS = 60 * 1000; // refresh lock every 60s
+
 const supportsTemperature = (name) => !/^gpt-5(\b|[-_])/.test(name);
 
 function res(statusCode, bodyObj) {
@@ -37,24 +40,36 @@ exports.handler = async function (event) {
     : getStore("openai-batch-csv");
 
   let jobId = "";
+  let lockTimer = null;
 
-  // ---- status+log writer (keeps last 50 events) ----
+  // ---- status writer with monotonic counters ----
   async function writeStatus(status, extra = {}, message) {
     if (!jobId) return;
     const now = new Date().toISOString();
     let prev = null;
     try { prev = await store.get(`jobs/${jobId}.status.json`, { type: "json" }); } catch {}
-    const events = Array.isArray(prev?.events) ? prev.events.slice(-49) : [];
-    if (message) events.push({ ts: now, msg: message });
+    const prevEvents = Array.isArray(prev?.events) ? prev.events.slice(-49) : [];
+    if (message) prevEvents.push({ ts: now, msg: message });
+
+    // enforce monotonic counters
+    const prevCompleted = Number(prev?.completedChunks || 0);
+    const prevProcessed = Number(prev?.processedRows || 0);
+    const nextCompleted = Math.max(prevCompleted, Number(extra?.completedChunks ?? prevCompleted));
+    const nextProcessed = Math.max(prevProcessed, Number(extra?.processedRows ?? prevProcessed));
+
     const payload = {
       jobId,
-      status,                           // "running" | "ready" | "failed"
+      status: status || prev?.status || "running",
       updatedAt: now,
-      // carry forward anything useful, then overwrite with latest fields
-      ...prev,
-      ...extra,
-      events,
+      totalChunks: Number(extra?.totalChunks ?? prev?.totalChunks ?? 0),
+      concurrency: Number(extra?.concurrency ?? prev?.concurrency ?? 0),
+      completedChunks: nextCompleted,
+      processedRows: nextProcessed,
+      partial: Boolean(extra?.partial || prev?.partial || false),
+      lastErrorStatus: extra?.lastErrorStatus ?? prev?.lastErrorStatus,
+      events: prevEvents,
     };
+
     try {
       await store.set(`jobs/${jobId}.status.json`, JSON.stringify(payload), {
         contentType: "application/json",
@@ -62,7 +77,33 @@ exports.handler = async function (event) {
     } catch {}
   }
 
-  // ---- retry helper (logs retries) ----
+  // ---- simple lock helpers to prevent double workers ----
+  async function acquireLock() {
+    const now = Date.now();
+    let lock = null;
+    try { lock = await store.get(`jobs/${jobId}.lock.json`, { type: "json" }); } catch {}
+    const lockTs = lock?.ts ? new Date(lock.ts).getTime() : 0;
+    const live = lockTs && (now - lockTs) < LOCK_TTL_MS;
+    if (live) {
+      await writeStatus("running", {}, "worker: another active worker holds lock, exiting");
+      return false;
+    }
+    await store.set(`jobs/${jobId}.lock.json`, JSON.stringify({ ts: new Date().toISOString() }), { contentType: "application/json" });
+    // start heartbeat
+    lockTimer = setInterval(async () => {
+      try {
+        await store.set(`jobs/${jobId}.lock.json`, JSON.stringify({ ts: new Date().toISOString() }), { contentType: "application/json" });
+      } catch {}
+    }, LOCK_HEARTBEAT_MS);
+    return true;
+  }
+  async function releaseLock() {
+    if (lockTimer) clearInterval(lockTimer);
+    lockTimer = null;
+    try { await store.delete?.(`jobs/${jobId}.lock.json`); } catch {}
+  }
+
+  // ---- retry helper ----
   async function callWithRetry(fn, { retries = 5, base = 300, max = 5000, label = "" } = {}) {
     let attempt = 0;
     for (;;) {
@@ -70,7 +111,6 @@ exports.handler = async function (event) {
         if (attempt > 0) await writeStatus("running", {}, `${label}: retry ${attempt}`);
         return await fn();
       } catch (err) {
-        // try to extract JSON error payload if present
         let errMsg = err?.message || String(err);
         try {
           const data = await err?.response?.json?.();
@@ -79,11 +119,11 @@ exports.handler = async function (event) {
         const status = err?.status || err?.statusCode || err?.response?.status;
         const retriable = status === 429 || (status >= 500 && status < 600) || !status;
         if (attempt >= retries || !retriable) {
-          await writeStatus("failed", { lastErrorStatus: status }, `${label}: giving up after ${attempt} retries → ${errMsg}`);
+          await writeStatus("failed", { lastErrorStatus: status }, `${label}: giving up after ${attempt} retries -> ${errMsg}`);
           throw err;
         }
         const delay = Math.min(max, base * Math.pow(2, attempt)) * (0.5 + Math.random());
-        await writeStatus("running", { lastErrorStatus: status }, `${label}: ${status || "err"} → backoff ${Math.round(delay)}ms`);
+        await writeStatus("running", { lastErrorStatus: status }, `${label}: ${status || "err"} -> backoff ${Math.round(delay)}ms`);
         await new Promise(r => setTimeout(r, delay));
         attempt++;
       }
@@ -95,12 +135,17 @@ exports.handler = async function (event) {
     jobId = body?.jobId || "";
     if (!jobId) return res(400, { error: "Missing jobId" });
 
+    // Acquire lock or exit if another worker is active
+    const locked = await acquireLock();
+    if (!locked) return res(202, { ok: true, ignored: true, jobId });
+
     await writeStatus("running", {}, "worker: start");
 
     // Load job meta saved by batch-create
     const meta = await store.get(`jobs/${jobId}.json`, { type: "json" }).catch(() => null);
     if (!meta) {
       await writeStatus("failed", {}, "meta not found");
+      await releaseLock();
       return res(404, { error: "Job metadata not found" });
     }
 
@@ -120,6 +165,7 @@ exports.handler = async function (event) {
     const csvTxt = await store.get(`csv/${jobId}.csv`, { type: "text" }).catch(() => null);
     if (!csvTxt) {
       await writeStatus("failed", {}, "csv missing");
+      await releaseLock();
       return res(404, { error: "Original CSV not found" });
     }
 
@@ -134,7 +180,7 @@ exports.handler = async function (event) {
 
     const items = rows.map((r, idx) => ({ id: idx, text: String(r?.[inputCol] ?? "") }));
 
-    // Instruction suffix (keeps the word "json" in context for text.format=json_object)
+    // Instruction suffix
     const suffix =
       ' You will receive a json object {"rows":[{"id":number,"text":string},...]}.' +
       ' For each item, produce {"id": same id, "cols": { /* one or more named columns */ }} following the user instructions above.' +
@@ -157,88 +203,127 @@ exports.handler = async function (event) {
       return b;
     }
 
-    // Chunk + plan
+    // Build chunks
     const chunks = [];
     for (let i = 0; i < items.length; i += chunkSize) chunks.push(items.slice(i, i + chunkSize));
     const totalChunks = chunks.length;
-    const concurrency = Math.max(1, Math.min(MAX_DIRECT_CONCURRENCY, Number(desiredConcurrency || 4)));
-    await writeStatus("running", { totalChunks, concurrency }, `plan: ${totalChunks} chunks @ conc=${concurrency}`);
 
-    // Run
+    // Resume detection - list already finished partials
+    const done = new Array(totalChunks).fill(false);
     let completedChunks = 0;
-    let i = 0;
+    try {
+      for await (const entry of store.list({ prefix: `partials/${jobId}/` })) {
+        const m = entry?.key && entry.key.match(/\/(\d+)\.json$/);
+        if (m) {
+          const idx = Number(m[1]);
+          if (Number.isFinite(idx) && idx >= 0 && idx < totalChunks && !done[idx]) {
+            done[idx] = true;
+            completedChunks++;
+          }
+        }
+      }
+    } catch {}
+    const processedRowsInit = Math.min(completedChunks * chunkSize, items.length);
+
+    // Initial status with resume info
+    const concurrency = Math.max(1, Math.min(MAX_DIRECT_CONCURRENCY, Number(desiredConcurrency || 4)));
+    await writeStatus("running",
+      { totalChunks, concurrency, completedChunks, processedRows: processedRowsInit, partial: completedChunks > 0 },
+      `plan: ${totalChunks} chunks @ conc=${concurrency} - resume ${completedChunks}/${totalChunks}`
+    );
+
+    // parts array to merge at the end, fill with nulls and keep already done as sentinel
     const parts = new Array(totalChunks);
+    // pickNext returns the next unfinished index
+    let nextIdx = 0;
+    function pickNext() {
+      while (nextIdx < totalChunks && done[nextIdx]) nextIdx++;
+      if (nextIdx >= totalChunks) return -1;
+      return nextIdx++;
+    }
 
-    async function worker(wid) {
-      while (i < totalChunks) {
-        const my = i++;
-        const label = `chunk#${my + 1}`;
+    async function doChunk(idx) {
+      const label = `chunk#${idx + 1}`;
+      const resp = await callWithRetry(
+        () => client.responses.create(buildBody(chunks[idx])),
+        { label }
+      );
+      let parsed = null;
+      try { parsed = JSON.parse(resp.output_text || ""); } catch {}
+      parts[idx] = parsed;
 
-        const resp = await callWithRetry(
-          () => client.responses.create(buildBody(chunks[my])),
-          { label }
+      // persist partial
+      try {
+        await store.set(
+          `partials/${jobId}/${idx}.json`,
+          JSON.stringify(parsed || {}),
+          { contentType: "application/json" }
         );
+      } catch {}
 
-        let parsed = null;
-        try { parsed = JSON.parse(resp.output_text || ""); } catch {}
-        parts[my] = parsed;
-        completedChunks++;
-        const processedRows = Math.min(completedChunks * chunkSize, items.length);
+      done[idx] = true;
+      completedChunks++;
+      const processedRows = Math.min(completedChunks * chunkSize, items.length);
+      await writeStatus(
+        "running",
+        { completedChunks, totalChunks, processedRows, partial: true },
+        `${label} done (${chunks[idx].length} rows) -> ${completedChunks}/${totalChunks}`
+      );
+    }
 
-        // persist a partial file for this chunk
+    async function worker() {
+      // refresh lock regularly while this worker runs
+      const beat = setInterval(async () => {
         try {
-          await store.set(
-            `partials/${jobId}/${my}.json`,
-            JSON.stringify(parsed || {}),
-            { contentType: "application/json" }
-          );
+          await store.set(`jobs/${jobId}.lock.json`, JSON.stringify({ ts: new Date().toISOString() }), { contentType: "application/json" });
         } catch {}
-
-        // Update status (keeps tail logs, counts, and marks partial availability)
-        await writeStatus(
-          "running",
-          { completedChunks, totalChunks, processedRows, partial: true },
-          `chunk#${my + 1} done (${chunks[my].length} rows) → ${completedChunks}/${totalChunks}`
-        );
+      }, LOCK_HEARTBEAT_MS);
+      try {
+        for (;;) {
+          const idx = pickNext();
+          if (idx === -1) break;
+          await doChunk(idx);
+        }
+      } finally {
+        clearInterval(beat);
       }
     }
 
-    await Promise.all(Array.from({ length: concurrency }, (_, k) => worker(k)));
+    // Spawn workers
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
 
-    // Merge → CSV with dynamic columns
-    const merged = rows.map((r) => ({ ...r })); // start with original fields
-    const colSet = new Set(); // collect dynamic column names
+    // Merge results to CSV
+    const merged = rows.map((r) => ({ ...r }));
+    const colSet = new Set();
 
-    for (const part of parts) {
+    for (let idx = 0; idx < totalChunks; idx++) {
+      const part = parts[idx] || await store.get(`partials/${jobId}/${idx}.json`, { type: "json" }).catch(() => null);
       if (!part) continue;
       const arr = Array.isArray(part.results) ? part.results
                 : (Array.isArray(part) ? part : null);
       if (!arr) continue;
 
       for (const item of arr) {
-        const idx = Number(item?.id);
-        if (!Number.isFinite(idx) || idx < 0 || idx >= merged.length) continue;
+        const outIdx = Number(item?.id);
+        if (!Number.isFinite(outIdx) || outIdx < 0 || outIdx >= merged.length) continue;
 
         if (item && typeof item.cols === "object" && item.cols !== null) {
           for (const [k, v] of Object.entries(item.cols)) {
             const vv = (v == null) ? "" : String(v);
-            merged[idx][k] = vv;
+            merged[outIdx][k] = vv;
             colSet.add(k);
           }
         } else if (typeof item?.result === "string") {
-          // backward-compat: old single-column shape
-          merged[idx].result = item.result;
+          merged[outIdx].result = item.result;
           colSet.add("result");
         }
       }
     }
 
-    // Prepare CSV headers: original headers + dynamic cols (stable order)
     const originalHeaders = Object.keys(rows[0] || {});
     const dynamicHeaders = Array.from(colSet);
     const headers = [...originalHeaders, ...dynamicHeaders];
 
-    // Serialize CSV (with BOM so Excel respects accents/¡¿)
     const csvStr = await new Promise((resolve, reject) => {
       csvStringify(merged, { header: true, columns: headers }, (err, out) => {
         if (err) reject(err); else resolve(out);
@@ -247,14 +332,14 @@ exports.handler = async function (event) {
     const csvWithBom = ensureUtf8Bom(csvStr);
 
     await store.set(`results/${jobId}.csv`, csvWithBom, { contentType: "text/csv; charset=utf-8" });
-    await writeStatus("ready", { finishedAt: new Date().toISOString() }, "csv written: ready");
+    await writeStatus("ready", { finishedAt: new Date().toISOString(), partial: true, completedChunks: totalChunks, processedRows: items.length }, "csv written: ready");
 
+    await releaseLock();
     return res(202, { ok: true, jobId, rows: rows.length });
   } catch (err) {
     console.error("direct-worker-background error:", err);
-    try {
-      await writeStatus("failed", {}, `fatal: ${err?.message || String(err)}`);
-    } catch {}
+    try { await writeStatus("failed", {}, `fatal: ${err?.message || String(err)}`); } catch {}
+    try { await releaseLock(); } catch {}
     return res(500, { error: err?.message || String(err) });
   }
 };
