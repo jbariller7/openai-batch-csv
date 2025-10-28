@@ -193,24 +193,46 @@ await writeStatus(
     }
     await Promise.all(Array.from({ length: concurrency }, (_, k) => worker(k)));
 
-    // Merge → CSV
-    const merged = rows.map((r) => ({ ...r, result: "" }));
-    for (const part of parts) {
-      if (!part?.results) continue;
-      for (const item of part.results) {
-        const idx = Number(item?.id);
-        if (Number.isFinite(idx) && idx >= 0 && idx < merged.length) {
-          merged[idx].result =
-            typeof item?.result === "string" ? item.result :
-            (item?.result != null ? String(item.result) : "");
-        }
-      }
-    }
+// Merge → CSV with dynamic columns
+const merged = rows.map((r) => ({ ...r })); // start with original fields
+const colSet = new Set(); // collect dynamic column names
 
-    const headers = Object.keys(merged[0] || {});
-    const csvStr = await new Promise((resolve, reject) => {
-      csvStringify(merged, { header: true, columns: headers }, (err, out) => err ? reject(err) : resolve(out));
-    });
+for (const part of parts) {
+  if (!part) continue;
+  const arr = Array.isArray(part.results) ? part.results
+            : (Array.isArray(part) ? part : null);
+  if (!arr) continue;
+
+  for (const item of arr) {
+    const idx = Number(item?.id);
+    if (!Number.isFinite(idx) || idx < 0 || idx >= merged.length) continue;
+
+    if (item && typeof item.cols === "object" && item.cols !== null) {
+      for (const [k, v] of Object.entries(item.cols)) {
+        const vv = (v == null) ? "" : String(v);
+        merged[idx][k] = vv;
+        colSet.add(k);
+      }
+    } else if (typeof item?.result === "string") {
+      // backward-compat: old single-column shape
+      merged[idx].result = item.result;
+      colSet.add("result");
+    }
+  }
+}
+
+// Prepare CSV headers: original headers + dynamic cols (stable order)
+const originalHeaders = Object.keys(rows[0] || {});
+const dynamicHeaders = Array.from(colSet);
+const headers = [...originalHeaders, ...dynamicHeaders];
+
+// Serialize CSV
+const csvStr = await new Promise((resolve, reject) => {
+  csvStringify(merged, { header: true, columns: headers }, (err, out) => {
+    if (err) reject(err); else resolve(out);
+  });
+});
+
 
     await store.set(`results/${jobId}.csv`, csvStr, { contentType: "text/csv; charset=utf-8" });
     await writeStatus("ready", { finishedAt: new Date().toISOString() }, "csv written: ready");
