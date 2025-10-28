@@ -1,4 +1,5 @@
-// netlify/functions/direct-worker-background.js (CommonJS + Lambda-style + detailed logs)
+// netlify/functions/direct-worker-background.js
+// CommonJS + Lambda-style + detailed logs + partials + multi-column merge + UTF-8 BOM
 
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
@@ -17,6 +18,9 @@ async function readJson(event) {
   const raw = event?.body || "";
   if (!raw) return {};
   try { return JSON.parse(b64 ? Buffer.from(raw, "base64").toString("utf8") : raw); } catch { return {}; }
+}
+function ensureUtf8Bom(str) {
+  return str && !str.startsWith("\uFEFF") ? "\uFEFF" + str : str;
 }
 
 exports.handler = async function (event) {
@@ -66,10 +70,16 @@ exports.handler = async function (event) {
         if (attempt > 0) await writeStatus("running", {}, `${label}: retry ${attempt}`);
         return await fn();
       } catch (err) {
+        // try to extract JSON error payload if present
+        let errMsg = err?.message || String(err);
+        try {
+          const data = await err?.response?.json?.();
+          if (data?.error?.message) errMsg = data.error.message;
+        } catch {}
         const status = err?.status || err?.statusCode || err?.response?.status;
         const retriable = status === 429 || (status >= 500 && status < 600) || !status;
         if (attempt >= retries || !retriable) {
-          await writeStatus("failed", { lastErrorStatus: status }, `${label}: giving up after ${attempt} retries → ${err?.message || err}`);
+          await writeStatus("failed", { lastErrorStatus: status }, `${label}: giving up after ${attempt} retries → ${errMsg}`);
           throw err;
         }
         const delay = Math.min(max, base * Math.pow(2, attempt)) * (0.5 + Math.random());
@@ -124,13 +134,13 @@ exports.handler = async function (event) {
 
     const items = rows.map((r, idx) => ({ id: idx, text: String(r?.[inputCol] ?? "") }));
 
+    // Instruction suffix (keeps the word "json" in context for text.format=json_object)
     const suffix =
-  ' You will receive a json object {"rows":[{"id":number,"text":string},...]}.' +
-  ' For each item, produce {"id": same id, "cols": { /* one or more named columns */ }} following the user instructions above.' +
-  ' The "cols" object must contain only string values (no nested objects/arrays).' +
-  ' The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"cols":{...}},...]} in the SAME ORDER as input.' +
-  ' Do not include any commentary.';
-
+      ' You will receive a json object {"rows":[{"id":number,"text":string},...]}.' +
+      ' For each item, produce {"id": same id, "cols": { /* one or more named columns */ }} following the user instructions above.' +
+      ' The "cols" object must contain only string values (no nested objects/arrays).' +
+      ' The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"cols":{...}},...]} in the SAME ORDER as input.' +
+      ' Do not include any commentary.';
 
     function buildBody(rowsChunk) {
       const b = {
@@ -163,78 +173,80 @@ exports.handler = async function (event) {
       while (i < totalChunks) {
         const my = i++;
         const label = `chunk#${my + 1}`;
-const resp = await callWithRetry(() => client.responses.create(buildBody(chunks[my])), { label });
-let parsed = null; try { parsed = JSON.parse(resp.output_text || ""); } catch {}
-parts[my] = parsed;
-completedChunks++;
-const processedRows = Math.min(completedChunks * chunkSize, items.length);
-// NEW: persist a partial file for this chunk
-await store.set(
-  `partials/${jobId}/${my}.json`,
-  JSON.stringify(parsed || {}),
-  { contentType: "application/json" }
-);
 
-// Update status (keeps tail logs, counts, and marks partial availability)
-await writeStatus(
-  "running",
-  { completedChunks, totalChunks, processedRows, partial: true },
-  `chunk#${my + 1} done (${chunks[my].length} rows) → ${completedChunks}/${totalChunks}`
-);
+        const resp = await callWithRetry(
+          () => client.responses.create(buildBody(chunks[my])),
+          { label }
+        );
 
-        // update every chunk (small jobs) or every 3 (bigger)
-        if (totalChunks <= 50 || completedChunks % 3 === 0 || completedChunks === totalChunks) {
-          await writeStatus("running",
-            { completedChunks, totalChunks, processedRows },
-            `${label} done (${chunks[my].length} rows) → ${completedChunks}/${totalChunks}`
+        let parsed = null;
+        try { parsed = JSON.parse(resp.output_text || ""); } catch {}
+        parts[my] = parsed;
+        completedChunks++;
+        const processedRows = Math.min(completedChunks * chunkSize, items.length);
+
+        // persist a partial file for this chunk
+        try {
+          await store.set(
+            `partials/${jobId}/${my}.json`,
+            JSON.stringify(parsed || {}),
+            { contentType: "application/json" }
           );
+        } catch {}
+
+        // Update status (keeps tail logs, counts, and marks partial availability)
+        await writeStatus(
+          "running",
+          { completedChunks, totalChunks, processedRows, partial: true },
+          `chunk#${my + 1} done (${chunks[my].length} rows) → ${completedChunks}/${totalChunks}`
+        );
+      }
+    }
+
+    await Promise.all(Array.from({ length: concurrency }, (_, k) => worker(k)));
+
+    // Merge → CSV with dynamic columns
+    const merged = rows.map((r) => ({ ...r })); // start with original fields
+    const colSet = new Set(); // collect dynamic column names
+
+    for (const part of parts) {
+      if (!part) continue;
+      const arr = Array.isArray(part.results) ? part.results
+                : (Array.isArray(part) ? part : null);
+      if (!arr) continue;
+
+      for (const item of arr) {
+        const idx = Number(item?.id);
+        if (!Number.isFinite(idx) || idx < 0 || idx >= merged.length) continue;
+
+        if (item && typeof item.cols === "object" && item.cols !== null) {
+          for (const [k, v] of Object.entries(item.cols)) {
+            const vv = (v == null) ? "" : String(v);
+            merged[idx][k] = vv;
+            colSet.add(k);
+          }
+        } else if (typeof item?.result === "string") {
+          // backward-compat: old single-column shape
+          merged[idx].result = item.result;
+          colSet.add("result");
         }
       }
     }
-    await Promise.all(Array.from({ length: concurrency }, (_, k) => worker(k)));
 
-// Merge → CSV with dynamic columns
-const merged = rows.map((r) => ({ ...r })); // start with original fields
-const colSet = new Set(); // collect dynamic column names
+    // Prepare CSV headers: original headers + dynamic cols (stable order)
+    const originalHeaders = Object.keys(rows[0] || {});
+    const dynamicHeaders = Array.from(colSet);
+    const headers = [...originalHeaders, ...dynamicHeaders];
 
-for (const part of parts) {
-  if (!part) continue;
-  const arr = Array.isArray(part.results) ? part.results
-            : (Array.isArray(part) ? part : null);
-  if (!arr) continue;
+    // Serialize CSV (with BOM so Excel respects accents/¡¿)
+    const csvStr = await new Promise((resolve, reject) => {
+      csvStringify(merged, { header: true, columns: headers }, (err, out) => {
+        if (err) reject(err); else resolve(out);
+      });
+    });
+    const csvWithBom = ensureUtf8Bom(csvStr);
 
-  for (const item of arr) {
-    const idx = Number(item?.id);
-    if (!Number.isFinite(idx) || idx < 0 || idx >= merged.length) continue;
-
-    if (item && typeof item.cols === "object" && item.cols !== null) {
-      for (const [k, v] of Object.entries(item.cols)) {
-        const vv = (v == null) ? "" : String(v);
-        merged[idx][k] = vv;
-        colSet.add(k);
-      }
-    } else if (typeof item?.result === "string") {
-      // backward-compat: old single-column shape
-      merged[idx].result = item.result;
-      colSet.add("result");
-    }
-  }
-}
-
-// Prepare CSV headers: original headers + dynamic cols (stable order)
-const originalHeaders = Object.keys(rows[0] || {});
-const dynamicHeaders = Array.from(colSet);
-const headers = [...originalHeaders, ...dynamicHeaders];
-
-// Serialize CSV
-const csvStr = await new Promise((resolve, reject) => {
-  csvStringify(merged, { header: true, columns: headers }, (err, out) => {
-    if (err) reject(err); else resolve(out);
-  });
-});
-
-
-    await store.set(`results/${jobId}.csv`, csvStr, { contentType: "text/csv; charset=utf-8" });
+    await store.set(`results/${jobId}.csv`, csvWithBom, { contentType: "text/csv; charset=utf-8" });
     await writeStatus("ready", { finishedAt: new Date().toISOString() }, "csv written: ready");
 
     return res(202, { ok: true, jobId, rows: rows.length });
