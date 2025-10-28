@@ -1,4 +1,5 @@
-// netlify/functions/batch-download.js (CommonJS + Lambda-style + partial support + multi-column merge)
+// netlify/functions/batch-download.js
+// CommonJS + Lambda-style + partial support + multi-column merge + UTF-8 BOM
 
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
@@ -19,12 +20,16 @@ function res(statusCode, body, headers) {
   };
 }
 
+function ensureUtf8Bom(str) {
+  return str && !str.startsWith("\uFEFF") ? "\uFEFF" + str : str;
+}
+
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS" || event.httpMethod === "HEAD") {
     return { statusCode: 204, headers: CORS, body: "" };
   }
 
-  // Parse query once (avoid duplicate declarations)
+  // Parse query once
   const rawUrl = typeof event?.rawUrl === "string" ? event.rawUrl : "";
   const url = rawUrl ? new URL(rawUrl) : null;
   const id = url?.searchParams.get("id") || event?.queryStringParameters?.id || "";
@@ -32,12 +37,12 @@ exports.handler = async (event) => {
 
   if (!id) return res(400, { error: "Missing id" });
 
-  // ESM deps (lazy import to stay CommonJS-friendly in Netlify)
+  // ESM deps (lazy import; stays CJS-compatible on Netlify)
   const { getStore } = await import("@netlify/blobs");
   const { default: OpenAI } = await import("openai");
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  // Blobs (with optional manual site creds for dev/local runners)
+  // Blobs (with optional manual site creds for local/dev runners)
   const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
   const token  = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
   const store  = (siteID && token)
@@ -49,7 +54,7 @@ exports.handler = async (event) => {
     let directCsvText = null;
     try { directCsvText = await store.get(`results/${id}.csv`, { type: "text" }); } catch {}
     if (typeof directCsvText === "string" && !wantPartial) {
-      return res(200, directCsvText, {
+      return res(200, ensureUtf8Bom(directCsvText), {
         "Content-Type": "text/csv; charset=utf-8",
         "Content-Disposition": `attachment; filename="${id}.csv"`,
       });
@@ -120,7 +125,7 @@ exports.handler = async (event) => {
           csvStringify(merged, { header: true, columns: headers }, (err, out) => err ? reject(err) : resolve(out));
         });
 
-        return res(200, csvStr, {
+        return res(200, ensureUtf8Bom(csvStr), {
           "Content-Type": "text/csv; charset=utf-8",
           "Content-Disposition": `attachment; filename="${id}.partial.csv"`,
           "X-Partial": "1",
@@ -222,7 +227,7 @@ exports.handler = async (event) => {
       csvStringify(merged, { header: true, columns: headers }, (err, out) => err ? reject(err) : resolve(out));
     });
 
-    return res(200, csvStr, {
+    return res(200, ensureUtf8Bom(csvStr), {
       "Content-Type": "text/csv; charset=utf-8",
       "Content-Disposition": `attachment; filename="${id}.csv"`,
     });
