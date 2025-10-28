@@ -51,11 +51,11 @@ export default function App() {
     pollRef.current = setInterval(() => checkDirectStatus(id), 3000);
   }
   function downloadPartial() {
-  if (!batchId) return;
-  log("Downloading partial CSV…");
-  const url = `${API_BASE}/batch-download?id=${encodeURIComponent(batchId)}&partial=1`;
-  window.location.href = url;
-}
+    if (!batchId) return;
+    log("Downloading partial CSV…");
+    const url = `${API_BASE}/batch-download?id=${encodeURIComponent(batchId)}&partial=1`;
+    window.location.href = url;
+  }
 
   useEffect(() => {
     // stop on terminal statuses (Batch) + "ready" (Direct)
@@ -89,13 +89,23 @@ export default function App() {
       log(`Preparing form…`);
       log(`File: ${file.name} (${file.size.toLocaleString()} bytes)`);
 
+      // Apply client-side dry-run speed hacks too (server also enforces)
+      let effectiveModel = model;
+      let effectiveChunk = chunkSize;
+      let effectiveEffort = reasoningEffort;
+      if (mode === "dry") {
+        if (effectiveModel.startsWith("gpt-5")) effectiveModel = "gpt-4.1-mini";
+        effectiveChunk = Math.min(chunkSize, 5);
+        effectiveEffort = "minimal";
+      }
+
       const fd = new FormData();
       fd.append("file", file);
       fd.append("inputCol", inputCol);
       fd.append("prompt", prompt);
-      fd.append("model", model);
-      fd.append("chunkSize", String(Math.max(1, Math.min(1000, Number(chunkSize) || 1))));
-      fd.append("reasoning_effort", reasoningEffort);
+      fd.append("model", effectiveModel);
+      fd.append("chunkSize", String(Math.max(1, Math.min(1000, Number(effectiveChunk) || 1))));
+      fd.append("reasoning_effort", effectiveEffort);
 
       // Testing helpers
       if (maxRows) fd.append("maxRows", String(maxRows));
@@ -106,7 +116,7 @@ export default function App() {
       }
 
       log(
-        `Submit → mode=${mode}, model=${model}, inputCol=${inputCol}, K=${chunkSize}, reasoning=${reasoningEffort}` +
+        `Submit → mode=${mode}, model=${effectiveModel}, inputCol=${inputCol}, K=${effectiveChunk}, reasoning=${effectiveEffort}` +
           (maxRows ? `, maxRows=${maxRows}` : "") +
           (mode === "direct" ? `, concurrency=${concurrency}` : "")
       );
@@ -210,7 +220,7 @@ export default function App() {
     }
   }
 
-  // ---- Direct mode status poller (progress + events) ----
+  // Direct mode status poller
   async function checkDirectStatus(idParam) {
     const id = idParam || batchId;
     if (!id) return;
@@ -261,21 +271,14 @@ export default function App() {
   function downloadOutput() {
     if (!batchId) return;
     log("Downloading merged CSV…");
-    // Works for BOTH: batch id or direct job id
     const url = downloadUrl || `${API_BASE}/batch-download?id=${encodeURIComponent(batchId)}`;
     window.location.href = url;
   }
 
-  function clearLogs() {
-    setLogs([]);
-  }
+  function clearLogs() { setLogs([]); }
   async function copyLogs() {
-    try {
-      await navigator.clipboard.writeText(logs.join("\n"));
-      log("Logs copied to clipboard.");
-    } catch {
-      log("Copy failed (clipboard permissions).");
-    }
+    try { await navigator.clipboard.writeText(logs.join("\n")); log("Logs copied to clipboard."); }
+    catch { log("Copy failed (clipboard permissions)."); }
   }
 
   return (
@@ -285,41 +288,27 @@ export default function App() {
         Upload a CSV, choose the input column, write your instruction, pick a model, set <em>Rows per request (K)</em>,
         then choose a <strong>Mode</strong>.
         <br />
-        <strong>Batch</strong> queues on OpenAI (slow). <strong>Dry run</strong> tests first chunk instantly.
+        <strong>Batch</strong> queues on OpenAI (slow). <strong>Dry run</strong> tests first chunk quickly.
         <strong> Direct</strong> processes everything now with parallel requests.
       </p>
 
       <form onSubmit={submitBatch} style={{ display: "grid", gap: 12 }}>
-        <label>
-          CSV File
-          <input
-            type="file"
-            accept=".csv"
-            onChange={(e) => {
-              const f = e.target.files?.[0] || null;
-              setFile(f);
-              if (f) log(`Selected file: ${f.name} (${f.size.toLocaleString()} bytes)`);
-            }}
-          />
+        <label>CSV File
+          <input type="file" accept=".csv" onChange={(e) => {
+            const f = e.target.files?.[0] || null; setFile(f);
+            if (f) log(`Selected file: ${f.name} (${f.size.toLocaleString()} bytes)`);
+          }}/>
         </label>
 
-        <label>
-          Input column name
+        <label>Input column name
           <input value={inputCol} onChange={(e) => setInputCol(e.target.value)} placeholder="text" />
         </label>
 
-        <label>
-          Instruction prompt
-          <textarea
-            rows={6}
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            placeholder="Describe what to do with each row..."
-          />
+        <label>Instruction prompt
+          <textarea rows={6} value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="Describe what to do with each row..." />
         </label>
 
-        <label>
-          Model
+        <label>Model
           <select value={model} onChange={(e) => setModel(e.target.value)}>
             {/* Add GPT-5 options if your org has access */}
             <option>gpt-5</option>
@@ -332,9 +321,8 @@ export default function App() {
         </label>
 
         {(isGpt5 || isOseries) && (
-          <label>
-            Reasoning effort
-            <select value={reasoningEffort} onChange={(e) => setReasoningEffort(e.target.value)}>
+          <label>Reasoning effort
+            <select value={reasoningEffort} onChange={e => setReasoningEffort(e.target.value)}>
               <option value="minimal">minimal</option>
               <option value="low">low</option>
               <option value="medium">medium</option>
@@ -343,8 +331,7 @@ export default function App() {
           </label>
         )}
 
-        <label>
-          Rows per request (K)
+        <label>Rows per request (K)
           <input
             type="number"
             min={1}
@@ -356,18 +343,16 @@ export default function App() {
 
         {/* Mode + test helpers */}
         <div style={{ display: "grid", gap: 8 }}>
-          <label>
-            Mode
+          <label>Mode
             <select value={mode} onChange={(e) => setMode(e.target.value)}>
               <option value="batch">Batch (slow, cheapest at scale)</option>
-              <option value="dry">Dry run (first chunk now)</option>
+              <option value="dry">Dry run (first chunk)</option>
               <option value="direct">Direct (process all now)</option>
             </select>
           </label>
 
           <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-            <label>
-              Max rows (test)
+            <label>Max rows (test)
               <input
                 type="number"
                 min={0}
@@ -378,8 +363,7 @@ export default function App() {
               />
             </label>
 
-            <label>
-              Concurrency
+            <label>Concurrency
               <input
                 type="number"
                 min={1}
@@ -393,11 +377,7 @@ export default function App() {
           </div>
         </div>
 
-        <button
-          type="submit"
-          disabled={isSubmitting}
-          style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
-        >
+        <button type="submit" disabled={isSubmitting} style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
           {isSubmitting ? (mode === "batch" ? "Creating Batch…" : "Processing…") : (mode === "batch" ? "Create Batch" : "Run Now")}
           {isSubmitting && <span aria-hidden>⏳</span>}
         </button>
@@ -406,12 +386,8 @@ export default function App() {
       {/* Job panel (works for Batch AND Direct) */}
       {batchId && (
         <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
-          <div>
-            <strong>Job ID:</strong> {batchId}
-          </div>
-          <div>
-            <strong>Status:</strong> {status || (lastRunMode === "direct" ? "running" : "(unknown)")}{" "}
-          </div>
+          <div><strong>Job ID:</strong> {batchId}</div>
+          <div><strong>Status:</strong> {status || (lastRunMode === "direct" ? "running" : "(unknown)")} </div>
 
           {lastRunMode === "direct" && !outputReady && (
             <div style={{ marginTop: 6, fontSize: 13, opacity: 0.8 }}>
@@ -423,30 +399,16 @@ export default function App() {
             {lastRunMode === "batch" && <button onClick={checkStatus}>Refresh Status</button>}
             {lastRunMode === "direct" && <button onClick={() => checkDirectStatus()}>Refresh Status</button>}
 
-            <button onClick={downloadOutput} disabled={!outputReady}>
-              Download merged CSV
-            </button>
+            <button onClick={downloadOutput} disabled={!outputReady}>Download merged CSV</button>
+
+            {lastRunMode === "direct" && !outputReady && (
+              <button onClick={downloadPartial}>Download partial CSV</button>
+            )}
 
             {lastRunMode === "direct" && downloadUrl && (
-              <a href={downloadUrl} style={{ alignSelf: "center" }}>
-                Open link
-              </a>
+              <a href={downloadUrl} style={{ alignSelf: "center" }}>Open link</a>
             )}
           </div>
-           <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-  {lastRunMode === "batch"  && <button onClick={checkStatus}>Refresh Status</button>}
-  {lastRunMode === "direct" && <button onClick={() => checkDirectStatus()}>Refresh Status</button>}
-
-  <button onClick={downloadOutput} disabled={!outputReady}>Download merged CSV</button>
-
-  {lastRunMode === "direct" && !outputReady && (
-    <button onClick={downloadPartial}>Download partial CSV</button>
-  )}
-
-  {lastRunMode === "direct" && downloadUrl && (
-    <a href={downloadUrl} style={{ alignSelf: "center" }}>Open link</a>
-  )}
-</div>
 
           {error && <p style={{ color: "crimson", marginTop: 8 }}>{error}</p>}
         </div>
@@ -458,19 +420,10 @@ export default function App() {
           <div style={{ marginBottom: 6 }}>
             <strong>Preview</strong> (Dry run: first chunk only)
           </div>
-          <pre
-            style={{
-              background: "#0b1020",
-              color: "#d7e3ff",
-              padding: 12,
-              borderRadius: 8,
-              maxHeight: 260,
-              overflow: "auto",
-              whiteSpace: "pre-wrap",
-              fontSize: 13,
-              lineHeight: 1.45,
-            }}
-          >
+          <pre style={{
+            background: "#0b1020", color: "#d7e3ff", padding: 12, borderRadius: 8,
+            maxHeight: 260, overflow: "auto", whiteSpace: "pre-wrap", fontSize: 13, lineHeight: 1.45
+          }}>
 {JSON.stringify(preview, null, 2)}
           </pre>
           {error && <p style={{ color: "crimson", marginTop: 8 }}>{error}</p>}
@@ -481,28 +434,14 @@ export default function App() {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
           <h2 style={{ margin: 0, fontSize: 18 }}>Console</h2>
           <div style={{ display: "flex", gap: 8 }}>
-            <button type="button" onClick={clearLogs}>
-              Clear
-            </button>
-            <button type="button" onClick={copyLogs}>
-              Copy
-            </button>
+            <button type="button" onClick={clearLogs}>Clear</button>
+            <button type="button" onClick={copyLogs}>Copy</button>
           </div>
         </div>
-        <pre
-          ref={logRef}
-          style={{
-            background: "#0b1020",
-            color: "#d7e3ff",
-            padding: 12,
-            borderRadius: 8,
-            maxHeight: 260,
-            overflow: "auto",
-            whiteSpace: "pre-wrap",
-            fontSize: 13,
-            lineHeight: 1.45,
-          }}
-        >
+        <pre ref={logRef} style={{
+          background: "#0b1020", color: "#d7e3ff", padding: 12, borderRadius: 8,
+          maxHeight: 260, overflow: "auto", whiteSpace: "pre-wrap", fontSize: 13, lineHeight: 1.45
+        }}>
 {logs.length ? logs.join("\n") : "Console will show progress, HTTP codes, and errors…"}
         </pre>
       </div>
