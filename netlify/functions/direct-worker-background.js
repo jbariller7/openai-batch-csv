@@ -125,10 +125,12 @@ exports.handler = async function (event) {
     const items = rows.map((r, idx) => ({ id: idx, text: String(r?.[inputCol] ?? "") }));
 
     const suffix =
-      ' You will receive a json object {"rows":[{"id":number,"text":string},...]}.'
-      + ' For each item, produce {"id": same id, "result": <string>} following the user instructions above.'
-      + ' The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]}'
-      + ' in the SAME ORDER as input. Do not include any commentary.';
+  ' You will receive a json object {"rows":[{"id":number,"text":string},...]}.' +
+  ' For each item, produce {"id": same id, "cols": { /* one or more named columns */ }} following the user instructions above.' +
+  ' The "cols" object must contain only string values (no nested objects/arrays).' +
+  ' The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"cols":{...}},...]} in the SAME ORDER as input.' +
+  ' Do not include any commentary.';
+
 
     function buildBody(rowsChunk) {
       const b = {
