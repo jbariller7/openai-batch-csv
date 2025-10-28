@@ -1,4 +1,4 @@
-// netlify/functions/batch-download.js (CommonJS + Lambda-style + partial support)
+// netlify/functions/batch-download.js (CommonJS + Lambda-style + partial support + multi-column merge)
 
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
@@ -28,16 +28,16 @@ exports.handler = async (event) => {
   const rawUrl = typeof event?.rawUrl === "string" ? event.rawUrl : "";
   const url = rawUrl ? new URL(rawUrl) : null;
   const id = url?.searchParams.get("id") || event?.queryStringParameters?.id || "";
-  const wantPartial = (url?.searchParams.get("partial") === "1");
+  const wantPartial = url?.searchParams.get("partial") === "1";
 
   if (!id) return res(400, { error: "Missing id" });
 
-  // ESM deps
+  // ESM deps (lazy import to stay CommonJS-friendly in Netlify)
   const { getStore } = await import("@netlify/blobs");
   const { default: OpenAI } = await import("openai");
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  // Blobs (with optional manual site creds)
+  // Blobs (with optional manual site creds for dev/local runners)
   const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
   const token  = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
   const store  = (siteID && token)
@@ -80,46 +80,45 @@ exports.handler = async (event) => {
         const completedChunks = Number(statusJson?.completedChunks || 0);
 
         // Merge available partials with dynamic columns
-const merged = rows.map((r) => ({ ...r }));
-const colSet = new Set();
+        const merged = rows.map((r) => ({ ...r }));
+        const colSet = new Set();
 
-const upper = completedChunks || totalChunks || 0;
-for (let i = 0; i < upper; i++) {
-  let part = null;
-  try { part = await store.get(`partials/${id}/${i}.json`, { type: "json" }); } catch {}
-  if (!part) continue;
+        const upper = completedChunks || totalChunks || 0;
+        for (let i = 0; i < upper; i++) {
+          let part = null;
+          try { part = await store.get(`partials/${id}/${i}.json`, { type: "json" }); } catch {}
+          if (!part) continue;
 
-  const arr = Array.isArray(part?.results) ? part.results
-           : (Array.isArray(part) ? part : null);
-  if (!arr) continue;
+          const arr = Array.isArray(part?.results) ? part.results
+                   : (Array.isArray(part) ? part : null);
+          if (!arr) continue;
 
-  for (const item of arr) {
-    const idx = Number(item?.id);
-    if (!Number.isFinite(idx) || idx < 0 || idx >= merged.length) continue;
+          for (const item of arr) {
+            const idx = Number(item?.id);
+            if (!Number.isFinite(idx) || idx < 0 || idx >= merged.length) continue;
 
-    if (item && typeof item.cols === "object" && item.cols !== null) {
-      for (const [k, v] of Object.entries(item.cols)) {
-        const vv = (v == null) ? "" : String(v);
-        merged[idx][k] = vv;
-        colSet.add(k);
-      }
-    } else if (typeof item?.result === "string") {
-      merged[idx].result = item.result;
-      colSet.add("result");
-    }
-  }
-}
+            if (item && typeof item.cols === "object" && item.cols !== null) {
+              for (const [k, v] of Object.entries(item.cols)) {
+                const vv = v == null ? "" : String(v);
+                merged[idx][k] = vv;
+                colSet.add(k);
+              }
+            } else if (typeof item?.result === "string") {
+              merged[idx].result = item.result;
+              colSet.add("result");
+            }
+          }
+        }
 
-// Headers = original + dynamic
-const originalHeaders = Object.keys(rows[0] || {});
-const dynamicHeaders = Array.from(colSet);
-const headers = [...originalHeaders, ...dynamicHeaders];
+        // Headers = original + dynamic
+        const originalHeaders = Object.keys(rows[0] || {});
+        const dynamicHeaders = Array.from(colSet);
+        const headers = [...originalHeaders, ...dynamicHeaders];
 
-// Serialize partial CSV
-const csvStr = await new Promise((resolve, reject) => {
-  csvStringify(merged, { header: true, columns: headers }, (err, out) => err ? reject(err) : resolve(out));
-});
-
+        // Serialize partial CSV
+        const csvStr = await new Promise((resolve, reject) => {
+          csvStringify(merged, { header: true, columns: headers }, (err, out) => err ? reject(err) : resolve(out));
+        });
 
         return res(200, csvStr, {
           "Content-Type": "text/csv; charset=utf-8",
@@ -160,17 +159,24 @@ const csvStr = await new Promise((resolve, reject) => {
     const outputBuf = Buffer.from(await fileResp.arrayBuffer());
     const jsonlLines = outputBuf.toString("utf8").trim().split("\n");
 
-    // Prepare merged rows (copy original + result column)
-    const merged = rows.map((r) => ({ ...r, result: "" }));
+    // Prepare merged rows (copy original); support dynamic multi-column outputs
+    const merged = rows.map((r) => ({ ...r }));
+    const colSet = new Set();
 
     const assignByArray = (arr, baseIndex = 0) => {
       arr.forEach((item, j) => {
         const idx = Number.isFinite(Number(item?.id)) ? Number(item.id) : baseIndex + j;
-        if (idx >= 0 && idx < merged.length) {
-          merged[idx].result =
-            typeof item?.result === "string"
-              ? item.result
-              : (item?.toString?.() ?? "");
+        if (idx < 0 || idx >= merged.length) return;
+
+        if (item && typeof item.cols === "object" && item.cols !== null) {
+          for (const [k, v] of Object.entries(item.cols)) {
+            const vv = v == null ? "" : String(v);
+            merged[idx][k] = vv;
+            colSet.add(k);
+          }
+        } else if (typeof item?.result === "string") {
+          merged[idx].result = item.result;
+          colSet.add("result");
         }
       });
     };
@@ -183,6 +189,7 @@ const csvStr = await new Promise((resolve, reject) => {
 
       const base = Number(obj?.custom_id) || 0;
       const body = obj?.response?.body || {};
+
       const text =
         typeof body?.output_text === "string"
           ? body.output_text
@@ -195,15 +202,22 @@ const csvStr = await new Promise((resolve, reject) => {
         assignByArray(parsed.results, base);
       } else if (Array.isArray(parsed)) {
         assignByArray(parsed, base);
+      } else if (parsed && typeof parsed.cols === "object" && parsed.cols !== null) {
+        assignByArray([{ id: base, cols: parsed.cols }], base);
       } else if (parsed && typeof parsed.result === "string") {
-        if (base >= 0 && base < merged.length) merged[base].result = parsed.result;
+        assignByArray([{ id: base, result: parsed.result }], base);
       } else if (typeof text === "string" && text) {
-        if (base >= 0 && base < merged.length) merged[base].result = text;
+        // Fallback: put free text into "result"
+        assignByArray([{ id: base, result: text }], base);
       }
     }
 
+    // Headers = original + dynamic
+    const originalHeaders = Object.keys(rows[0] || {});
+    const dynamicHeaders = Array.from(colSet);
+    const headers = [...originalHeaders, ...dynamicHeaders];
+
     // Serialize merged CSV
-    const headers = Object.keys(merged[0] || {});
     const csvStr = await new Promise((resolve, reject) => {
       csvStringify(merged, { header: true, columns: headers }, (err, out) => err ? reject(err) : resolve(out));
     });
