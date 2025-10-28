@@ -1,17 +1,15 @@
-// netlify/functions/batch-create.js
-// CommonJS + Lambda-style returns
+// netlify/functions/batch-create.js (CommonJS + Lambda-style, dry-run speed fixes)
 
-const { randomUUID } = require("node:crypto");
 const Busboy = require("busboy");
 const { parse: csvParse } = require("csv-parse");
+
+exports.config = { /* path: "/api/batch-create" */ };
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST,OPTIONS,HEAD",
   "Access-Control-Allow-Headers": "Content-Type",
 };
-
-exports.config = { /* path: "/api/batch-create" */ };
 
 const supportsTemperature = (name) => !/^gpt-5(\b|[-_])/.test(name);
 
@@ -107,13 +105,15 @@ exports.handler = async function (event) {
       return res(400, { error: "CSV file is required" });
     }
 
-    // Store original CSV
-    const jobId = randomUUID();
+    // Blobs store
     const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
     const token  = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
     const store  = (siteID && token)
       ? getStore({ name: "openai-batch-csv", siteID, token })
       : getStore("openai-batch-csv");
+
+    // Store original CSV
+    const jobId = crypto.randomUUID();
     await store.set(`csv/${jobId}.csv`, fileBuffer, { contentType: "text/csv; charset=utf-8" });
 
     // Parse CSV
@@ -130,35 +130,44 @@ exports.handler = async function (event) {
     const supportsReasoning =
       /^o\d/i.test(model) || model.startsWith("o") || model.startsWith("gpt-5");
 
+    // Common suffix (mentions "json" so text.format works)
     const suffix =
       ' You will receive a json object {"rows":[{"id":number,"text":string},...]}.' +
       ' For each item, produce {"id": same id, "result": <string>} following the user instructions above.' +
       ' The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]}' +
       ' in the SAME ORDER as input. Do not include any commentary.';
 
-    // DRY RUN
+    // DRY RUN (fast model, minimal effort, tiny K) to avoid function 504s
     if (dryRun) {
-      const firstChunk = effectiveRows.slice(0, chunkSize).map((r, j) => ({
+      const dryK = Math.min(chunkSize, 5);
+      const firstChunk = effectiveRows.slice(0, dryK).map((r, j) => ({
         id: j,
         text: String(r?.[inputCol] ?? ""),
       }));
+
+      const modelForDry = model.startsWith("gpt-5") ? "gpt-4.1-mini" : model;
+      const effortForDry = "minimal";
+
       const body = {
-        model,
+        model: modelForDry,
         input: [
           { role: "system", content: `${prompt}${suffix}` },
           { role: "user", content: "Return only a json object as specified. The output must be valid json." },
           { role: "user", content: JSON.stringify({ rows: firstChunk }) }
         ],
         text: { format: { type: "json_object" } },
-        ...(supportsTemperature(model) ? { temperature: 0 } : {}),
-        ...(supportsReasoning && reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+        ...(supportsTemperature(modelForDry) ? { temperature: 0 } : {}),
+        ...( ( /^o\d/i.test(modelForDry) || modelForDry.startsWith("o") || modelForDry.startsWith("gpt-5") )
+            ? { reasoning: { effort: effortForDry } }
+            : {} ),
       };
+
       const resp = await client.responses.create(body);
       let parsed = null; try { parsed = JSON.parse(resp.output_text || ""); } catch {}
-      return res(200, { mode: "dryRun", jobId, usedRows: firstChunk.length, model, response: resp, parsed });
+      return res(200, { mode: "dryRun", jobId, usedRows: firstChunk.length, model: modelForDry, response: resp, parsed });
     }
 
-    // ---- DIRECT: kick off the background worker and return 202 (or 500 on invoke failure)
+    // DIRECT: kick off the background worker and return 202
     if (direct) {
       // Persist metadata for the worker
       await store.set(
@@ -176,7 +185,7 @@ exports.handler = async function (event) {
         { contentType: "application/json" }
       );
 
-      // Seed an initial status so the UI shows progress immediately
+      // Seed initial status
       const now = new Date().toISOString();
       await store.set(
         `jobs/${jobId}.status.json`,
@@ -189,9 +198,8 @@ exports.handler = async function (event) {
         { contentType: "application/json" }
       );
 
-      // ---- BUILD ORIGIN FROM INCOMING REQUEST HEADERS (works in prod & netlify dev)
+      // Build origin to call background worker
       const hdrs = event.headers || {};
-
       const host =
         hdrs["x-forwarded-host"] ||
         hdrs["host"] ||
@@ -205,7 +213,6 @@ exports.handler = async function (event) {
           ? `${proto}://${host}`
           : (process.env.NETLIFY_SITE_URL || process.env.URL || process.env.DEPLOY_URL || "http://localhost:8888");
 
-      // Try to invoke the background worker; if it fails, mark job failed and bubble up
       try {
         const wr = await fetch(`${origin}/.netlify/functions/direct-worker-background`, {
           method: "POST",
@@ -226,11 +233,7 @@ exports.handler = async function (event) {
             }),
             { contentType: "application/json" }
           );
-          return {
-            statusCode: 500,
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ error: msg }),
-          };
+          return res(500, { error: msg });
         }
       } catch (e) {
         const msg = `worker invoke error: ${e?.message || String(e)}`;
@@ -245,28 +248,20 @@ exports.handler = async function (event) {
           }),
           { contentType: "application/json" }
         );
-        return {
-          statusCode: 500,
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ error: msg }),
-        };
+        return res(500, { error: msg });
       }
 
       // Tell the UI how to poll + where to download once ready
-      return {
-        statusCode: 202,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "direct",
-          jobId,
-          model,
-          rowCount: effectiveRows.length,
-          download: `/.netlify/functions/batch-download?id=${jobId}`,
-        }),
-      };
+      return res(202, {
+        mode: "direct",
+        jobId,
+        model,
+        rowCount: effectiveRows.length,
+        download: `/.netlify/functions/batch-download?id=${jobId}`,
+      });
     }
 
-    // BATCH
+    // BATCH: build JSONL lines and enqueue
     const lines = [];
     for (let start = 0; start < effectiveRows.length; start += chunkSize) {
       const chunk = effectiveRows.slice(start, start + chunkSize).map((r, j) => ({
