@@ -1,6 +1,6 @@
 // netlify/functions/batch-reconstruct.js
 // Rebuild CSV from an OpenAI batch_<...> id by merging OUTPUT with your original CSV
-// CommonJS + Lambda-style + UTF-8 BOM + multi-column support + gpt-5 output shape
+// CommonJS + Lambda-style + UTF-8 BOM + multi-column support + gpt-5 output shape + repair for U+FFFD corruption
 
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
@@ -13,6 +13,44 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
+// --- Unicode helpers ---
+function normalizeUtf(s) {
+  if (s == null) return "";
+  let t = String(s);
+
+  // Normalize to NFC (composed accents)
+  if (typeof t.normalize === "function") t = t.normalize("NFC");
+
+  // Fix the most common replacement-char cases we saw:
+  //  - "\uFFFDdiga" → "¡diga"
+  t = t.replace(/(?:^|\s)\uFFFD(diga)/gi, (m, g1) => ` ¡${g1}`);
+  //  - "\uFFFD?" → "¿"
+  t = t.replace(/\uFFFD\?/g, "¿");
+  //  - "s\uFFFDndwich" → "sándwich" (common Spanish word)
+  t = t.replace(/s\uFFFDndwich/gi, "sándwich");
+
+  // As a last resort, drop any leftover U+FFFD
+  t = t.replace(/\uFFFD/g, "");
+
+  return t;
+}
+
+// If the model sometimes returns a stringified JSON inside `result`,
+// parse it and return { cols } if that shape is present.
+function parseResultPossiblyJson(resultStr) {
+  if (typeof resultStr !== "string") return null;
+  const r = resultStr.trim();
+  if (!r.startsWith("{") || r.length < 2) return null;
+  try {
+    const obj = JSON.parse(r);
+    if (obj && typeof obj.cols === "object" && obj.cols !== null) {
+      return obj; // { cols: {...} }
+    }
+  } catch {}
+  return null;
+}
+
+// --- Generic helpers ---
 function res(statusCode, body, headers) {
   return {
     statusCode,
@@ -121,7 +159,7 @@ exports.handler = async (event) => {
         if (!rowsChunk) continue;
         rowsChunk.forEach((r, j) => {
           const globalId = Number.isFinite(Number(r?.id)) ? Number(r.id) : (base + j);
-          const text = String(r?.text ?? "");
+          const text = normalizeUtf(String(r?.text ?? ""));
           idToInput.set(globalId, text);
         });
       }
@@ -138,7 +176,7 @@ exports.handler = async (event) => {
       if (!idToCols.has(id)) idToCols.set(id, {});
       const acc = idToCols.get(id);
       for (const [k, v] of Object.entries(colsObj)) {
-        acc[k] = v == null ? "" : String(v);
+        acc[k] = normalizeUtf(v == null ? "" : String(v));
       }
     };
 
@@ -157,7 +195,9 @@ exports.handler = async (event) => {
           if (item && typeof item.cols === "object" && item.cols !== null) {
             pushCols(id, item.cols);
           } else if (typeof item?.result === "string") {
-            pushCols(id, { result: item.result });
+            const maybe = parseResultPossiblyJson(item.result);
+            if (maybe?.cols) pushCols(id, maybe.cols);
+            else pushCols(id, { result: item.result });
           }
         });
       } else if (Array.isArray(parsed)) {
@@ -166,7 +206,9 @@ exports.handler = async (event) => {
           if (item && typeof item.cols === "object" && item.cols !== null) {
             pushCols(id, item.cols);
           } else if (typeof item?.result === "string") {
-            pushCols(id, { result: item.result });
+            const maybe = parseResultPossiblyJson(item.result);
+            if (maybe?.cols) pushCols(id, maybe.cols);
+            else pushCols(id, { result: item.result });
           }
         });
       } else if (parsed && typeof parsed === "object") {
@@ -174,7 +216,9 @@ exports.handler = async (event) => {
         if (parsed.cols && typeof parsed.cols === "object") {
           pushCols(id, parsed.cols);
         } else if (typeof parsed.result === "string") {
-          pushCols(id, { result: parsed.result });
+          const maybe = parseResultPossiblyJson(parsed.result);
+          if (maybe?.cols) pushCols(id, maybe.cols);
+          else pushCols(id, { result: parsed.result });
         }
       } else if (typeof outputText === "string" && outputText) {
         pushCols(base, { result: outputText });
@@ -194,7 +238,6 @@ exports.handler = async (event) => {
     let outRows = [];
 
     if (originalRows && originalRows.length) {
-      // Use original CSV rows and headers, then add dynamic result columns not already present
       const dynamicHeaders = Array.from(resultColSet).filter(h => !originalHeaders.includes(h));
       headers = [...originalHeaders, ...dynamicHeaders];
 
@@ -205,7 +248,6 @@ exports.handler = async (event) => {
         return row;
       });
     } else {
-      // Fallback to id + input_text + dynamic result columns
       const allIds = new Set([
         ...Array.from(idToInput.keys()),
         ...Array.from(idToCols.keys()),
