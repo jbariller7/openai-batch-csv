@@ -1,6 +1,7 @@
 // netlify/functions/batch-reconstruct.js
 // Rebuild CSV from an OpenAI batch_<...> id by merging OUTPUT with your original CSV
-// CommonJS + Lambda-style + UTF-8 BOM + multi-column support + gpt-5 output shape + repair for U+FFFD corruption
+// CommonJS + Lambda-style + UTF-8 BOM + multi-column support + gpt-5 output shape
+// Extra: robust U+FFFD normalization (Se\uFFFDor → Señor, etc.) and post-pass to unpack {"cols":{...}} strings.
 
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
@@ -21,15 +22,29 @@ function normalizeUtf(s) {
   // Normalize to NFC (composed accents)
   if (typeof t.normalize === "function") t = t.normalize("NFC");
 
-  // Fix the most common replacement-char cases we saw:
-  //  - "\uFFFDdiga" → "¡diga"
-  t = t.replace(/(?:^|\s)\uFFFD(diga)/gi, (m, g1) => ` ¡${g1}`);
-  //  - "\uFFFD?" → "¿"
-  t = t.replace(/\uFFFD\?/g, "¿");
-  //  - "s\uFFFDndwich" → "sándwich" (common Spanish word)
-  t = t.replace(/s\uFFFDndwich/gi, "sándwich");
+  // Common Spanish corruption repairs involving U+FFFD:
+  // Punctuation
+  t = t.replace(/\uFFFD\?/g, "¿");        // \uFFFD? → ¿
+  t = t.replace(/(?:^|\s)\uFFFD(diga)/gi, (m, g1) => ` ¡${g1}`); // \uFFFDdiga → ¡diga
 
-  // As a last resort, drop any leftover U+FFFD
+  // Words seen frequently
+  t = t.replace(/s\uFFFDndwich/gi, "sándwich"); // s\uFFFDndwich → sándwich
+  t = t.replace(/\bSe\uFFFDor\b/g, "Señor");
+  t = t.replace(/\bSe\uFFFDora\b/g, "Señora");
+  t = t.replace(/\bSe\uFFFDorita\b/g, "Señorita");
+  t = t.replace(/\bEspa\uFFFDol\b/gi, "español");
+  t = t.replace(/\bEspa\uFFFDa\b/gi, "España");
+  t = t.replace(/a\uFFFDo(s)?\b/gi, "año$1");
+  t = t.replace(/ma\uFFFDana\b/gi, "mañana");
+  t = t.replace(/ni\uFFFD(o|a|os|as)\b/gi, "niñ$1");
+  t = t.replace(/lecci\uFFFDn(es)?\b/gi, "lección$1");
+  t = t.replace(/canci\uFFFDn(es)?\b/gi, "canción$1");
+  t = t.replace(/coraz\uFFFDn(es)?\b/gi, "corazón$1");
+
+  // Heuristic: U+FFFD between vowels often is ñ in Spanish words
+  t = t.replace(/([AEIOUaeiou])\uFFFD([AEIOUaeiou])/g, "$1ñ$2");
+
+  // As a last resort, drop leftover U+FFFD so it doesn’t eat letters in CSV viewers
   t = t.replace(/\uFFFD/g, "");
 
   return t;
@@ -50,7 +65,6 @@ function parseResultPossiblyJson(resultStr) {
   return null;
 }
 
-// --- Generic helpers ---
 function res(statusCode, body, headers) {
   return {
     statusCode,
@@ -63,7 +77,7 @@ function ensureUtf8Bom(str) {
   return str && !str.startsWith("\uFEFF") ? "\uFEFF" + str : str;
 }
 
-// Pull the JSON string from the many response.body shapes
+// Pull the JSON string from the many response.body shapes (gpt-4.1 / gpt-5)
 function extractOutputJsonText(body) {
   if (typeof body?.output_text === "string" && body.output_text.trim()) return body.output_text;
   if (typeof body?.content === "string" && body.content.trim()) return body.content;
@@ -116,7 +130,7 @@ exports.handler = async (event) => {
       ? getStore({ name: "openai-batch-csv", siteID, token })
       : getStore("openai-batch-csv");
 
-    // 1) Retrieve batch metadata from OpenAI
+    // 1) Retrieve batch metadata
     const b = await client.batches.retrieve(batchId);
     if (!b) return res(404, { error: "Batch not found" });
     if (!b.output_file_id) return res(400, { error: "Batch has no output_file_id. It may not be completed yet." });
@@ -227,6 +241,20 @@ exports.handler = async (event) => {
       if (obj?.error) {
         const emsg = obj.error?.message || JSON.stringify(obj.error);
         idToError.set(base, emsg);
+      }
+    }
+
+    // 5b) Post-pass: if a row ended up with a single "result" key whose value is a JSON string like {"cols":{...}},
+    // unpack it into proper columns now.
+    for (const [id, cols] of idToCols.entries()) {
+      if (cols && typeof cols.result === "string") {
+        const maybe = parseResultPossiblyJson(cols.result);
+        if (maybe?.cols && typeof maybe.cols === "object") {
+          delete cols.result;
+          for (const [k, v] of Object.entries(maybe.cols)) {
+            cols[k] = normalizeUtf(v == null ? "" : String(v));
+          }
+        }
       }
     }
 
