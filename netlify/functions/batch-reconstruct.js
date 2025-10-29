@@ -1,6 +1,6 @@
 // netlify/functions/batch-reconstruct.js
-// Rebuild a CSV *only* from an OpenAI batch id (batch_...), no prior blobs needed.
-// CommonJS + Lambda style. It also caches the rebuilt CSV to Blobs for future use.
+// Rebuild CSV from an OpenAI batch_<…> id by merging input and output JSONL
+// CommonJS + Lambda-style + UTF-8 BOM + multi-column support
 
 const { stringify: csvStringify } = require("csv-stringify");
 
@@ -20,185 +20,216 @@ function res(statusCode, body, headers) {
   };
 }
 
+function ensureUtf8Bom(str) {
+  return str && !str.startsWith("\uFEFF") ? "\uFEFF" + str : str;
+}
+
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS" || event.httpMethod === "HEAD") {
     return { statusCode: 204, headers: CORS, body: "" };
   }
 
-  // Parse query
-  const rawUrl = typeof event?.rawUrl === "string" ? event.rawUrl : "";
-  const url = rawUrl ? new URL(rawUrl) : null;
-  const id = url?.searchParams.get("id") || event?.queryStringParameters?.id || "";
-  if (!id || !id.startsWith("batch_")) {
-    return res(400, { error: "Pass a valid ?id=batch_XXXXXX" });
-  }
-
-  // Lazy ESM imports to remain CommonJS-compatible in Netlify
-  const { getStore } = await import("@netlify/blobs");
-  const { default: OpenAI } = await import("openai");
-  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-  // Blobs (site creds optional; helpful in local/dev)
-  const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
-  const token  = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
-  const store  = (siteID && token)
-    ? getStore({ name: "openai-batch-csv", siteID, token })
-    : getStore("openai-batch-csv");
-
   try {
-    // If we already rebuilt this in the past, serve it from cache
-    try {
-      const cached = await store.get(`results/${id}.reconstructed.csv`, { type: "text" });
-      if (typeof cached === "string" && cached.length) {
-        return res(200, cached, {
-          "Content-Type": "text/csv; charset=utf-8",
-          "Content-Disposition": `attachment; filename="${id}.csv"`,
-          "X-Reconstructed": "1",
-          "X-Cache": "hit",
+    // Read query
+    const rawUrl = typeof event?.rawUrl === "string" ? event.rawUrl : "";
+    const url = rawUrl ? new URL(rawUrl) : null;
+    const batchId = url?.searchParams.get("id") || event?.queryStringParameters?.id || "";
+    if (!batchId || !batchId.startsWith("batch_")) {
+      return res(400, { error: "Provide a valid OpenAI batch id starting with 'batch_' via ?id=batch_xxx" });
+    }
+
+    // Lazy ESM deps
+    const { default: OpenAI } = await import("openai");
+    const { getStore } = await import("@netlify/blobs");
+
+    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+    // Optional manual creds for local/dev
+    const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
+    const token  = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
+    const store  = (siteID && token)
+      ? getStore({ name: "openai-batch-csv", siteID, token })
+      : getStore("openai-batch-csv");
+
+    // 1) Retrieve batch
+    const b = await client.batches.retrieve(batchId);
+    if (!b) return res(404, { error: "Batch not found" });
+    if (!b.output_file_id) return res(400, { error: "Batch has no output_file_id (not completed?)" });
+    if (!b.input_file_id) {
+      // Older or unusual runs: we can still reconstruct results-only CSV
+      // but we won’t have input_text. We try anyway below.
+    }
+
+    // 2) Download INPUT JSONL to rebuild the original inputs per global id
+    const idToInput = new Map(); // id -> input_text
+    if (b.input_file_id) {
+      const inputResp = await client.files.content(b.input_file_id);
+      const inputBuf = Buffer.from(await inputResp.arrayBuffer());
+      const inputLines = inputBuf.toString("utf8").split(/\r?\n/).filter(Boolean);
+
+      for (const line of inputLines) {
+        let obj;
+        try { obj = JSON.parse(line); } catch { continue; }
+        const base = Number(obj?.custom_id) || 0;
+        const body = obj?.body || {};
+
+        // Our request shape: body.input is an array of messages, and the rows chunk
+        // was put into the 3rd message (index 2), as a JSON string.
+        //   body.input[2].content === JSON.stringify({ rows: [...] })
+        let rowsJson = null;
+        try {
+          const msg = Array.isArray(body?.input) ? body.input[2] : null;
+          const content = typeof msg?.content === "string" ? msg.content : null;
+          if (content) rowsJson = JSON.parse(content);
+        } catch {}
+
+        const rowsChunk = rowsJson && Array.isArray(rowsJson.rows) ? rowsJson.rows : null;
+        if (!rowsChunk) continue;
+
+        // Map each local row to global id: globalId = base + indexWithinChunk
+        rowsChunk.forEach((r, j) => {
+          const globalId = Number.isFinite(Number(r?.id)) ? Number(r.id) : (base + j);
+          const text = String(r?.text ?? "");
+          idToInput.set(globalId, text);
         });
       }
-    } catch {}
-
-    // 1) Retrieve the batch
-    const batch = await client.batches.retrieve(id);
-    if (batch.status !== "completed") {
-      return res(400, { error: `Batch not completed. Status: ${batch.status}` });
-    }
-    if (!batch.output_file_id) {
-      return res(400, { error: "Batch has no output_file_id" });
     }
 
-    // 2) Download OUTPUT JSONL
-    const outResp = await client.files.content(batch.output_file_id);
-    const outBuf  = Buffer.from(await outResp.arrayBuffer());
-    const outLines = outBuf.toString("utf8").trim().split("\n");
+    // 3) Download OUTPUT JSONL and gather results per id
+    const idToCols = new Map();   // id -> { [colName]: value }
+    const idToError = new Map();  // id -> string (if any)
 
-    // 3) Optionally download INPUT JSONL (to recover the original text)
-    //    Not all SDKs expose input id back, but when present it helps.
-    //    Fall back to empty map if not available or fails.
-    let inputMap = new Map(); // id -> input_text
-    const inputFileId = batch.input_file_id || batch.request_file_id || batch.inputFileId; // try a few likely names
-    if (inputFileId) {
-      try {
-        const inResp = await client.files.content(inputFileId);
-        const inBuf  = Buffer.from(await inResp.arrayBuffer());
-        const inLines = inBuf.toString("utf8").trim().split("\n");
-
-        for (const line of inLines) {
-          if (!line.trim()) continue;
-          let obj; try { obj = JSON.parse(line); } catch { continue; }
-          // Our JSONL lines look like: { method, url, custom_id, body }
-          // body.input[2] is { role: 'user', content: JSON.stringify({ rows:[{id,text},...]}) }
-          const base = Number(obj?.custom_id) || 0;
-          const body = obj?.body || obj?.request_body || {};
-          const msgs = Array.isArray(body?.input) ? body.input : [];
-          const rowPayloadMsg = msgs.find(m => m && m.role === "user" && typeof m.content === "string" && m.content.includes('"rows"'));
-          if (!rowPayloadMsg) continue;
-          let payload; try { payload = JSON.parse(rowPayloadMsg.content); } catch { continue; }
-          const arr = Array.isArray(payload?.rows) ? payload.rows : [];
-          for (let j = 0; j < arr.length; j++) {
-            const item = arr[j];
-            const idNum = Number.isFinite(Number(item?.id)) ? Number(item.id) : (base + j);
-            if (typeof item?.text === "string") inputMap.set(idNum, item.text);
-          }
-        }
-      } catch {
-        // ignore if input file retrieval fails
-      }
-    }
-
-    // 4) Parse OUTPUT JSONL and build a normalized table keyed by id
-    //    We support:
-    //    - {"results":[{"id":n,"cols":{...}},...]}
-    //    - {"results":[{"id":n,"result":"..."}...]}
-    //    - free-text fallback to "result"
-    const table = new Map(); // id -> { cols: {k:v,...} } or { result: "..." }
-    const dynamicCols = new Set();
-
-    function assignResult(idNum, obj) {
-      if (!Number.isFinite(idNum)) return;
-      const row = table.get(idNum) || { cols: {} };
-      if (obj && typeof obj.cols === "object" && obj.cols !== null) {
-        for (const [k, v] of Object.entries(obj.cols)) {
-          row.cols[k] = v == null ? "" : String(v);
-          dynamicCols.add(k);
-        }
-      } else if (typeof obj?.result === "string") {
-        row.cols.result = obj.result;
-        dynamicCols.add("result");
-      }
-      table.set(idNum, row);
-    }
+    const outResp = await client.files.content(b.output_file_id);
+    const outBuf = Buffer.from(await outResp.arrayBuffer());
+    const outLines = outBuf.toString("utf8").split(/\r?\n/).filter(Boolean);
 
     for (const line of outLines) {
-      if (!line.trim()) continue;
       let obj; try { obj = JSON.parse(line); } catch { continue; }
 
       const base = Number(obj?.custom_id) || 0;
-      const body = obj?.response?.body || obj?.body || {};
-      const text =
-        typeof body?.output_text === "string" ? body.output_text
-        : typeof body?.content === "string" ? body.content
-        : "";
+      const body = obj?.response?.body || {};
+      const outputText =
+        typeof body?.output_text === "string"
+          ? body.output_text
+          : (typeof body?.content === "string" ? body.content : "");
 
-      let parsed = null; if (text) { try { parsed = JSON.parse(text); } catch {} }
+      // Try parsing the JSON results object we asked the model for
+      let parsed = null;
+      if (outputText) {
+        try { parsed = JSON.parse(outputText); } catch { /* leave null */ }
+      }
 
-      const arr =
-        (parsed && Array.isArray(parsed.results)) ? parsed.results
-      : (Array.isArray(parsed) ? parsed : null);
+      const pushCols = (id, colsObj) => {
+        if (!idToCols.has(id)) idToCols.set(id, {});
+        const acc = idToCols.get(id);
+        for (const [k, v] of Object.entries(colsObj)) {
+          acc[k] = v == null ? "" : String(v);
+        }
+      };
 
-      if (arr) {
-        arr.forEach((item, j) => {
-          const idNum = Number.isFinite(Number(item?.id)) ? Number(item.id) : (base + j);
-          assignResult(idNum, item);
+      // Cases:
+      //  - {"results":[{"id":..., "cols": {...}}, ...]}
+      //  - {"results":[{"id":..., "result": "..."}, ...]}
+      //  - {"id":..., "cols": {...}} or {"id":..., "result": "..."} (unlikely but safe)
+      //  - array fallback
+      if (parsed && Array.isArray(parsed.results)) {
+        parsed.results.forEach((item, j) => {
+          const id = Number.isFinite(Number(item?.id)) ? Number(item.id) : (base + j);
+          if (item && typeof item.cols === "object" && item.cols !== null) {
+            pushCols(id, item.cols);
+          } else if (typeof item?.result === "string") {
+            pushCols(id, { result: item.result });
+          }
         });
-      } else if (parsed && typeof parsed.cols === "object") {
-        assignResult(base, parsed);
-      } else if (parsed && typeof parsed.result === "string") {
-        assignResult(base, parsed);
-      } else if (typeof text === "string" && text) {
-        assignResult(base, { result: text });
+      } else if (Array.isArray(parsed)) {
+        parsed.forEach((item, j) => {
+          const id = Number.isFinite(Number(item?.id)) ? Number(item.id) : (base + j);
+          if (item && typeof item.cols === "object" && item.cols !== null) {
+            pushCols(id, item.cols);
+          } else if (typeof item?.result === "string") {
+            pushCols(id, { result: item.result });
+          }
+        });
+      } else if (parsed && typeof parsed === "object") {
+        const id = base;
+        if (parsed.cols && typeof parsed.cols === "object") {
+          pushCols(id, parsed.cols);
+        } else if (typeof parsed.result === "string") {
+          pushCols(id, { result: parsed.result });
+        }
+      } else if (typeof outputText === "string" && outputText) {
+        // Fallback: free text into result column
+        pushCols(base, { result: outputText });
+      }
+
+      // Capture error text if present
+      if (obj?.error) {
+        const id = base;
+        const emsg = obj.error?.message || JSON.stringify(obj.error);
+        idToError.set(id, emsg);
       }
     }
 
-    // 5) Build rows for CSV
-    // Sort by numeric id (stable, predictable)
-    const ids = Array.from(table.keys()).sort((a, b) => a - b);
+    // 4) Build rows: union of ids we saw anywhere
+    const allIds = new Set([
+      ...Array.from(idToInput.keys()),
+      ...Array.from(idToCols.keys()),
+      ...Array.from(idToError.keys()),
+    ]);
+    const sortedIds = Array.from(allIds).sort((a, b) => a - b);
 
-    // Columns: id, input_text (if available), then dynamic result cols
-    const dynamicHeaders = Array.from(dynamicCols);
-    const headers = ["id", ...(inputMap.size ? ["input_text"] : []), ...dynamicHeaders];
+    // Collect all dynamic column names encountered in results
+    const colSet = new Set();
+    for (const [, cols] of idToCols) {
+      for (const k of Object.keys(cols)) colSet.add(k);
+    }
+    // Common first columns
+    const headers = ["id"];
+    // Include input_text if we have at least one
+    const hasAnyInput = Array.from(idToInput.values()).some(v => v !== undefined);
+    if (hasAnyInput) headers.push("input_text");
+    // Then dynamic result columns in stable order
+    headers.push(...Array.from(colSet));
 
-    const records = ids.map(idNum => {
-      const rec = { id: idNum };
-      if (inputMap.size) rec.input_text = inputMap.get(idNum) ?? "";
-      const data = table.get(idNum) || { cols: {} };
-      for (const k of dynamicHeaders) {
-        rec[k] = data.cols?.[k] ?? "";
+    // 5) Serialize CSV with BOM
+    const outRows = [];
+    for (const id of sortedIds) {
+      const row = { id };
+      if (hasAnyInput) row.input_text = idToInput.get(id) ?? "";
+      const cols = idToCols.get(id) || {};
+      for (const h of headers) {
+        if (h === "id" || h === "input_text") continue;
+        row[h] = cols[h] ?? "";
       }
-      return rec;
-    });
+      // If there was an error for this id and no cols, you could optionally expose it.
+      // Example: row.error = idToError.get(id) || "";
+      outRows.push(row);
+    }
 
-    // 6) Serialize CSV
+    // If nothing parsed, produce a helpful error
+    if (!outRows.length) {
+      return res(404, {
+        error: "No rows reconstructed. Double-check the batch id, and ensure your jobs returned JSON in output_text.",
+      });
+    }
+
     const csvStr = await new Promise((resolve, reject) => {
-      csvStringify(records, { header: true, columns: headers }, (err, out) => {
-        if (err) reject(err);
-        else resolve(out);
+      csvStringify(outRows, { header: true, columns: headers }, (err, out) => {
+        if (err) reject(err); else resolve(out);
       });
     });
+    const csvWithBom = ensureUtf8Bom(csvStr);
 
-    // Cache for future requests
+    // Persist a copy in blobs for future downloads
     try {
-      await store.set(`results/${id}.reconstructed.csv`, csvStr, {
+      await store.set(`results/${batchId}.reconstructed.csv`, csvWithBom, {
         contentType: "text/csv; charset=utf-8",
       });
     } catch {}
 
-    return res(200, csvStr, {
+    return res(200, csvWithBom, {
       "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="${id}.csv"`,
-      "X-Reconstructed": "1",
-      "X-Cache": "miss",
+      "Content-Disposition": `attachment; filename="${batchId}.csv"`,
     });
   } catch (e) {
     console.error("batch-reconstruct error:", e);
