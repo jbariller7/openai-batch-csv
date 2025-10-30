@@ -121,14 +121,9 @@ exports.handler = async (event) => {
         const headers = [...originalHeaders, ...dynamicHeaders];
 
         // Serialize partial CSV
-const csvStr = await new Promise((resolve, reject) => {
-  csvStringify(
-    merged,
-    { header: true, columns: headers, quote: '`', escape: '`' },
-    (err, out) => err ? reject(err) : resolve(out)
-  );
-});
-
+        const csvStr = await new Promise((resolve, reject) => {
+          csvStringify(merged, { header: true, columns: headers }, (err, out) => err ? reject(err) : resolve(out));
+        });
 
         return res(200, ensureUtf8Bom(csvStr), {
           "Content-Type": "text/csv; charset=utf-8",
@@ -228,14 +223,9 @@ const csvStr = await new Promise((resolve, reject) => {
     const headers = [...originalHeaders, ...dynamicHeaders];
 
     // Serialize merged CSV
-const csvStr = await new Promise((resolve, reject) => {
-  csvStringify(
-    merged,
-    { header: true, columns: headers, quote: '`', escape: '`' },
-    (err, out) => err ? reject(err) : resolve(out)
-  );
-});
-
+    const csvStr = await new Promise((resolve, reject) => {
+      csvStringify(merged, { header: true, columns: headers }, (err, out) => err ? reject(err) : resolve(out));
+    });
 
     return res(200, ensureUtf8Bom(csvStr), {
       "Content-Type": "text/csv; charset=utf-8",
