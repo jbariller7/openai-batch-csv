@@ -299,14 +299,11 @@ exports.handler = async (event) => {
       return res(404, { error: "No rows reconstructed. Check that blobs metadata exists or the batch output contains JSON." });
     }
 
-const csvStr = await new Promise((resolve, reject) => {
-  csvStringify(
-    outRows,
-    { header: true, columns: headers, quote: '`', escape: '`' },
-    (err, out) => (err ? reject(err) : resolve(out))
-  );
-});
-
+    const csvStr = await new Promise((resolve, reject) => {
+      csvStringify(outRows, { header: true, columns: headers }, (err, out) => {
+        if (err) reject(err); else resolve(out);
+      });
+    });
     const csvWithBom = ensureUtf8Bom(csvStr);
 
     // Save a copy for convenience
