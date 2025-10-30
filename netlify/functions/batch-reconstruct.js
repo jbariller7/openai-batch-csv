@@ -14,6 +14,11 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
+// ---- Excel/CSV helpers ----
+function ensureUtf8Bom(str) {
+  return str && !str.startsWith("\uFEFF") ? "\uFEFF" + str : str;
+}
+
 // --- Unicode helpers ---
 function normalizeUtf(s) {
   if (s == null) return "";
@@ -71,10 +76,6 @@ function res(statusCode, body, headers) {
     headers: { ...(headers || {}), ...CORS },
     body: typeof body === "string" ? body : JSON.stringify(body ?? {}),
   };
-}
-
-function ensureUtf8Bom(str) {
-  return str && !str.startsWith("\uFEFF") ? "\uFEFF" + str : str;
 }
 
 // Pull the JSON string from the many response.body shapes (gpt-4.1 / gpt-5)
