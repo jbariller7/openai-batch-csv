@@ -1,7 +1,8 @@
 // netlify/functions/batch-reconstruct.js
 // Rebuild CSV from an OpenAI batch_<...> id by merging OUTPUT with your original CSV
 // CommonJS + Lambda-style + UTF-8 BOM + multi-column support + gpt-5 output shape
-// Extra: robust U+FFFD normalization (Se\uFFFDor → Señor, etc.) and post-pass to unpack {"cols":{...}} strings.
+// Robust U+FFFD normalization (Se\uFFFDor → Señor), post-pass to unpack {"cols":{...}} strings,
+// and FINAL STEP: replace ALL line breaks in every cell with a single space.
 
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
@@ -14,9 +15,31 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-// ---- Excel/CSV helpers ----
+function res(statusCode, body, headers) {
+  return {
+    statusCode,
+    headers: { ...(headers || {}), ...CORS },
+    body: typeof body === "string" ? body : JSON.stringify(body ?? {}),
+  };
+}
+
 function ensureUtf8Bom(str) {
   return str && !str.startsWith("\uFEFF") ? "\uFEFF" + str : str;
+}
+
+// --- NEWLINE SANITIZER (hard replace with spaces) ---
+function replaceAllLineBreaksWithSpace(rows) {
+  return rows.map((r) => {
+    const out = {};
+    for (const [k, v] of Object.entries(r)) {
+      let s = v == null ? "" : String(v);
+      // Replace all CR/LF combos with a single space, then collapse multiple spaces
+      s = s.replace(/\r\n/g, " ").replace(/\n/g, " ").replace(/\r/g, " ");
+      s = s.replace(/[ \t]+/g, " ").trim(); // normalize spacing
+      out[k] = s;
+    }
+    return out;
+  });
 }
 
 // --- Unicode helpers ---
@@ -68,14 +91,6 @@ function parseResultPossiblyJson(resultStr) {
     }
   } catch {}
   return null;
-}
-
-function res(statusCode, body, headers) {
-  return {
-    statusCode,
-    headers: { ...(headers || {}), ...CORS },
-    body: typeof body === "string" ? body : JSON.stringify(body ?? {}),
-  };
 }
 
 // Pull the JSON string from the many response.body shapes (gpt-4.1 / gpt-5)
@@ -245,8 +260,7 @@ exports.handler = async (event) => {
       }
     }
 
-    // 5b) Post-pass: if a row ended up with a single "result" key whose value is a JSON string like {"cols":{...}},
-    // unpack it into proper columns now.
+    // 5b) Post-pass: unpack {"cols":{...}} strings left inside a "result" key
     for (const [id, cols] of idToCols.entries()) {
       if (cols && typeof cols.result === "string") {
         const maybe = parseResultPossiblyJson(cols.result);
@@ -300,8 +314,11 @@ exports.handler = async (event) => {
       return res(404, { error: "No rows reconstructed. Check that blobs metadata exists or the batch output contains JSON." });
     }
 
+    // FINAL PASS: replace ALL line breaks in every cell with a space
+    const flattenedRows = replaceAllLineBreaksWithSpace(outRows);
+
     const csvStr = await new Promise((resolve, reject) => {
-      csvStringify(outRows, { header: true, columns: headers }, (err, out) => {
+      csvStringify(flattenedRows, { header: true, columns: headers }, (err, out) => {
         if (err) reject(err); else resolve(out);
       });
     });
