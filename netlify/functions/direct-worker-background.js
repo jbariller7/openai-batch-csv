@@ -324,20 +324,11 @@ exports.handler = async function (event) {
     const dynamicHeaders = Array.from(colSet);
     const headers = [...originalHeaders, ...dynamicHeaders];
 
-const csvStr = await new Promise((resolve, reject) => {
-  csvStringify(
-    merged,
-    {
-      header: true,
-      columns: headers,
-      // use backticks for quoting
-      quote: '`',
-      escape: '`',
-    },
-    (err, out) => (err ? reject(err) : resolve(out))
-  );
-});
-
+    const csvStr = await new Promise((resolve, reject) => {
+      csvStringify(merged, { header: true, columns: headers }, (err, out) => {
+        if (err) reject(err); else resolve(out);
+      });
+    });
     const csvWithBom = ensureUtf8Bom(csvStr);
 
     await store.set(`results/${jobId}.csv`, csvWithBom, { contentType: "text/csv; charset=utf-8" });
