@@ -1,8 +1,8 @@
 // netlify/functions/batch-reconstruct.js
 // Rebuild CSV from an OpenAI batch_<...> id by merging OUTPUT with your original CSV
 // CommonJS + Lambda-style + UTF-8 BOM + multi-column support + gpt-5 output shape
-// Robust U+FFFD normalization (Se\uFFFDor → Señor), post-pass to unpack {"cols":{...}} strings,
-// and FINAL STEP: replace ALL line breaks in every cell with a single space.
+// Robust U+FFFD normalization (Se\uFFFDor → Señor). Replaces ALL line breaks with spaces.
+// Aggressively unwraps cases where a whole JSON string like {"cols":{...}} lands in "result".
 
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
@@ -27,15 +27,14 @@ function ensureUtf8Bom(str) {
   return str && !str.startsWith("\uFEFF") ? "\uFEFF" + str : str;
 }
 
-// --- NEWLINE SANITIZER (hard replace with spaces) ---
-function replaceAllLineBreaksWithSpace(rows) {
+// --- CR/LF → space (for Excel) ---
+function flattenNewlines(rows) {
   return rows.map((r) => {
     const out = {};
     for (const [k, v] of Object.entries(r)) {
       let s = v == null ? "" : String(v);
-      // Replace all CR/LF combos with a single space, then collapse multiple spaces
       s = s.replace(/\r\n/g, " ").replace(/\n/g, " ").replace(/\r/g, " ");
-      s = s.replace(/[ \t]+/g, " ").trim(); // normalize spacing
+      s = s.replace(/[ \t]+/g, " ").trim();
       out[k] = s;
     }
     return out;
@@ -46,17 +45,10 @@ function replaceAllLineBreaksWithSpace(rows) {
 function normalizeUtf(s) {
   if (s == null) return "";
   let t = String(s);
-
-  // Normalize to NFC (composed accents)
   if (typeof t.normalize === "function") t = t.normalize("NFC");
-
-  // Common Spanish corruption repairs involving U+FFFD:
-  // Punctuation
-  t = t.replace(/\uFFFD\?/g, "¿");        // \uFFFD? → ¿
-  t = t.replace(/(?:^|\s)\uFFFD(diga)/gi, (m, g1) => ` ¡${g1}`); // \uFFFDdiga → ¡diga
-
-  // Words seen frequently
-  t = t.replace(/s\uFFFDndwich/gi, "sándwich"); // s\uFFFDndwich → sándwich
+  t = t.replace(/\uFFFD\?/g, "¿");
+  t = t.replace(/(?:^|\s)\uFFFD(diga)/gi, (m, g1) => ` ¡${g1}`);
+  t = t.replace(/s\uFFFDndwich/gi, "sándwich");
   t = t.replace(/\bSe\uFFFDor\b/g, "Señor");
   t = t.replace(/\bSe\uFFFDora\b/g, "Señora");
   t = t.replace(/\bSe\uFFFDorita\b/g, "Señorita");
@@ -68,28 +60,47 @@ function normalizeUtf(s) {
   t = t.replace(/lecci\uFFFDn(es)?\b/gi, "lección$1");
   t = t.replace(/canci\uFFFDn(es)?\b/gi, "canción$1");
   t = t.replace(/coraz\uFFFDn(es)?\b/gi, "corazón$1");
-
-  // Heuristic: U+FFFD between vowels often is ñ in Spanish words
   t = t.replace(/([AEIOUaeiou])\uFFFD([AEIOUaeiou])/g, "$1ñ$2");
-
-  // As a last resort, drop leftover U+FFFD so it doesn’t eat letters in CSV viewers
   t = t.replace(/\uFFFD/g, "");
-
   return t;
 }
 
-// If the model sometimes returns a stringified JSON inside `result`,
-// parse it and return { cols } if that shape is present.
-function parseResultPossiblyJson(resultStr) {
-  if (typeof resultStr !== "string") return null;
-  const r = resultStr.trim();
-  if (!r.startsWith("{") || r.length < 2) return null;
-  try {
-    const obj = JSON.parse(r);
-    if (obj && typeof obj.cols === "object" && obj.cols !== null) {
-      return obj; // { cols: {...} }
+// Try very hard to turn a string into an object like { cols: {...} }
+function parseResultPossiblyJson(raw) {
+  if (typeof raw !== "string") return null;
+  let r = raw.trim();
+  if (!r) return null;
+
+  // Quick guard: must at least look like JSON with "cols"
+  if (!r.includes('"cols"') && !r.includes("'cols'") && !r.startsWith("{")) return null;
+
+  // Attempt up to two parses (handles double-encoded strings)
+  for (let i = 0; i < 2; i++) {
+    try {
+      const obj = JSON.parse(r);
+      if (obj && typeof obj === "object") {
+        if (obj.cols && typeof obj.cols === "object") return { cols: obj.cols };
+        // Some models wrap again: { result: "{\"cols\":{...}}" }
+        if (typeof obj.result === "string") {
+          r = obj.result;
+          continue;
+        }
+      }
+      break;
+    } catch {
+      // If the string is quoted JSON with heavy escaping, try a light unescape of \" → "
+      const unescaped = r.replace(/\\"/g, '"');
+      if (unescaped !== r) { r = unescaped; continue; }
+      return null;
     }
-  } catch {}
+  }
+  // Last-chance: strip outer quotes if present and try once
+  if ((r.startsWith('"') && r.endsWith('"')) || (r.startsWith("'") && r.endsWith("'"))) {
+    try {
+      const obj = JSON.parse(r.slice(1, -1));
+      if (obj && typeof obj.cols === "object") return { cols: obj.cols };
+    } catch {}
+  }
   return null;
 }
 
@@ -136,7 +147,6 @@ exports.handler = async (event) => {
     // Lazy ESM deps
     const { default: OpenAI } = await import("openai");
     const { getStore } = await import("@netlify/blobs");
-
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
     // Optional manual creds for local/dev
@@ -173,10 +183,8 @@ exports.handler = async (event) => {
       const inputResp = await client.files.content(b.input_file_id);
       const inputBuf = Buffer.from(await inputResp.arrayBuffer());
       const inputLines = inputBuf.toString("utf8").split(/\r?\n/).filter(Boolean);
-
       for (const line of inputLines) {
-        let obj;
-        try { obj = JSON.parse(line); } catch { continue; }
+        let obj; try { obj = JSON.parse(line); } catch { continue; }
         const base = Number(obj?.custom_id) || 0;
         const body = obj?.body || {};
         let rowsJson = null;
@@ -251,7 +259,10 @@ exports.handler = async (event) => {
           else pushCols(id, { result: parsed.result });
         }
       } else if (typeof outputText === "string" && outputText) {
-        pushCols(base, { result: outputText });
+        // Fallback: try to unwrap here BEFORE pushing "result"
+        const maybe = parseResultPossiblyJson(outputText);
+        if (maybe?.cols) pushCols(base, maybe.cols);
+        else pushCols(base, { result: outputText });
       }
 
       if (obj?.error) {
@@ -260,7 +271,7 @@ exports.handler = async (event) => {
       }
     }
 
-    // 5b) Post-pass: unpack {"cols":{...}} strings left inside a "result" key
+    // 5b) Post-pass: aggressively unwrap {"cols":{...}} still trapped in a "result" string
     for (const [id, cols] of idToCols.entries()) {
       if (cols && typeof cols.result === "string") {
         const maybe = parseResultPossiblyJson(cols.result);
@@ -314,8 +325,8 @@ exports.handler = async (event) => {
       return res(404, { error: "No rows reconstructed. Check that blobs metadata exists or the batch output contains JSON." });
     }
 
-    // FINAL PASS: replace ALL line breaks in every cell with a space
-    const flattenedRows = replaceAllLineBreaksWithSpace(outRows);
+    // FINAL: remove all CR/LF from every cell (Excel-safe)
+    const flattenedRows = flattenNewlines(outRows);
 
     const csvStr = await new Promise((resolve, reject) => {
       csvStringify(flattenedRows, { header: true, columns: headers }, (err, out) => {
