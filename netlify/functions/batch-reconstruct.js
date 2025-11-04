@@ -22,6 +22,12 @@ function res(statusCode, body, headers) {
   };
 }
 
+// Ensure UTF-8 BOM for Excel compatibility
+function ensureUtf8Bom(str) {
+  return str && !str.startsWith("\uFEFF") ? "\uFEFF" + str : str;
+}
+
+// Parse CSV content
 async function parseCsvText(csvTxt) {
   return new Promise((resolve, reject) => {
     const out = [];
@@ -32,6 +38,38 @@ async function parseCsvText(csvTxt) {
   });
 }
 
+// Normalize UTF-8 text (handle U+FFFD replacements)
+function normalizeUtf(s) {
+  if (s == null) return "";
+  let t = String(s);
+
+  // Normalize to NFC (composed accents)
+  if (typeof t.normalize === "function") t = t.normalize("NFC");
+
+  // Common Spanish corruption repairs involving U+FFFD:
+  t = t.replace(/\uFFFD\?/g, "¿");        // \uFFFD? → ¿
+  t = t.replace(/(?:^|\s)\uFFFD(diga)/gi, (m, g1) => ` ¡${g1}`); // \uFFFDdiga → ¡diga
+  t = t.replace(/s\uFFFDndwich/gi, "sándwich"); // s\uFFFDndwich → sándwich
+  t = t.replace(/\bSe\uFFFDor\b/g, "Señor");
+  t = t.replace(/\bSe\uFFFDora\b/g, "Señora");
+  t = t.replace(/\bSe\uFFFDorita\b/g, "Señorita");
+  t = t.replace(/\bEspa\uFFFDol\b/gi, "español");
+  t = t.replace(/\bEspa\uFFFDa\b/gi, "España");
+  t = t.replace(/a\uFFFDo(s)?\b/gi, "año$1");
+  t = t.replace(/ma\uFFFDana\b/gi, "mañana");
+  t = t.replace(/ni\uFFFD(o|a|os|as)\b/gi, "niñ$1");
+  t = t.replace(/lecci\uFFFDn(es)?\b/gi, "lección$1");
+  t = t.replace(/canci\uFFFDn(es)?\b/gi, "canción$1");
+  t = t.replace(/coraz\uFFFDn(es)?\b/gi, "corazón$1");
+  t = t.replace(/([AEIOUaeiou])\uFFFD([AEIOUaeiou])/g, "$1ñ$2"); // U+FFFD between vowels is often ñ
+
+  // Drop any leftover U+FFFD so it doesn’t eat letters in CSV viewers
+  t = t.replace(/\uFFFD/g, "");
+
+  return t;
+}
+
+// --- Main handler ---
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS" || event.httpMethod === "HEAD") {
     return { statusCode: 204, headers: CORS, body: "" };
@@ -56,7 +94,7 @@ exports.handler = async (event) => {
       ? getStore({ name: "openai-batch-csv", siteID, token })
       : getStore("openai-batch-csv");
 
-    // 1) Retrieve batch metadata from OpenAI
+    // 1) Retrieve batch metadata
     const b = await client.batches.retrieve(batchId);
     if (!b) return res(404, { error: "Batch not found" });
     if (!b.output_file_id) return res(400, { error: "Batch has no output_file_id. It may not be completed yet." });
@@ -87,7 +125,7 @@ exports.handler = async (event) => {
       if (!idToCols.has(id)) idToCols.set(id, {});
       const acc = idToCols.get(id);
       for (const [k, v] of Object.entries(colsObj)) {
-        acc[k] = v == null ? "" : String(v);
+        acc[k] = normalizeUtf(v == null ? "" : String(v));
       }
     };
 
