@@ -1,11 +1,12 @@
 // netlify/functions/batch-reconstruct.js
 // Rebuild CSV from an OpenAI batch_<...> id by merging OUTPUT with your original CSV
 // CommonJS + Lambda-style + UTF-8 BOM + multi-column support + gpt-5 output shape
-// Robust U+FFFD normalization (Se\uFFFDor → Señor). Replaces ALL line breaks with spaces.
-// Aggressively unwraps cases where a whole JSON string like {"cols":{...}} lands in "result".
+// Robust U+FFFD normalization, unwrap {"cols":{...}} in "result", replace ALL line breaks with spaces,
+// gzip large outputs, and if still too big, save to Netlify Blobs and 303-redirect to a streaming proxy.
 
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
+const zlib = require("zlib");
 
 exports.config = { /* path: "/api/batch-reconstruct" */ };
 
@@ -20,6 +21,7 @@ function res(statusCode, body, headers) {
     statusCode,
     headers: { ...(headers || {}), ...CORS },
     body: typeof body === "string" ? body : JSON.stringify(body ?? {}),
+    isBase64Encoded: false,
   };
 }
 
@@ -70,31 +72,22 @@ function parseResultPossiblyJson(raw) {
   if (typeof raw !== "string") return null;
   let r = raw.trim();
   if (!r) return null;
-
-  // Quick guard: must at least look like JSON with "cols"
   if (!r.includes('"cols"') && !r.includes("'cols'") && !r.startsWith("{")) return null;
 
-  // Attempt up to two parses (handles double-encoded strings)
   for (let i = 0; i < 2; i++) {
     try {
       const obj = JSON.parse(r);
       if (obj && typeof obj === "object") {
         if (obj.cols && typeof obj.cols === "object") return { cols: obj.cols };
-        // Some models wrap again: { result: "{\"cols\":{...}}" }
-        if (typeof obj.result === "string") {
-          r = obj.result;
-          continue;
-        }
+        if (typeof obj.result === "string") { r = obj.result; continue; }
       }
       break;
     } catch {
-      // If the string is quoted JSON with heavy escaping, try a light unescape of \" → "
       const unescaped = r.replace(/\\"/g, '"');
       if (unescaped !== r) { r = unescaped; continue; }
       return null;
     }
   }
-  // Last-chance: strip outer quotes if present and try once
   if ((r.startsWith('"') && r.endsWith('"')) || (r.startsWith("'") && r.endsWith("'"))) {
     try {
       const obj = JSON.parse(r.slice(1, -1));
@@ -144,12 +137,10 @@ exports.handler = async (event) => {
       return res(400, { error: "Provide a valid OpenAI batch id starting with 'batch_' via ?id=batch_xxx" });
     }
 
-    // Lazy ESM deps
     const { default: OpenAI } = await import("openai");
     const { getStore } = await import("@netlify/blobs");
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-    // Optional manual creds for local/dev
     const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
     const token  = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
     const store  = (siteID && token)
@@ -161,12 +152,12 @@ exports.handler = async (event) => {
     if (!b) return res(404, { error: "Batch not found" });
     if (!b.output_file_id) return res(400, { error: "Batch has no output_file_id. It may not be completed yet." });
 
-    // 2) Try to load your job metadata from Netlify to locate original CSV
+    // 2) Load job metadata (if present) to locate original CSV
     let meta = null;
     try { meta = await store.get(`jobs/${batchId}.json`, { type: "json" }); } catch {}
     const hasOriginalCsv = !!meta?.jobId;
 
-    // 3) If we have original CSV, load it
+    // 3) Load original CSV if we have it
     let originalRows = null;
     let originalHeaders = [];
     if (hasOriginalCsv) {
@@ -177,7 +168,7 @@ exports.handler = async (event) => {
       }
     }
 
-    // 4) Build id -> input (fallback from OpenAI INPUT file if original is missing)
+    // 4) Build id->input fallback from OpenAI input if needed
     const idToInput = new Map();
     if (!originalRows && b.input_file_id) {
       const inputResp = await client.files.content(b.input_file_id);
@@ -203,9 +194,8 @@ exports.handler = async (event) => {
       }
     }
 
-    // 5) Read OpenAI OUTPUT JSONL to collect results
-    const idToCols = new Map();   // id -> { [col]: value }
-    const idToError = new Map();  // id -> error text
+    // 5) Read OpenAI output JSONL
+    const idToCols = new Map();
     const outResp = await client.files.content(b.output_file_id);
     const outBuf = Buffer.from(await outResp.arrayBuffer());
     const outLines = outBuf.toString("utf8").split(/\r?\n/).filter(Boolean);
@@ -259,19 +249,13 @@ exports.handler = async (event) => {
           else pushCols(id, { result: parsed.result });
         }
       } else if (typeof outputText === "string" && outputText) {
-        // Fallback: try to unwrap here BEFORE pushing "result"
         const maybe = parseResultPossiblyJson(outputText);
         if (maybe?.cols) pushCols(base, maybe.cols);
         else pushCols(base, { result: outputText });
       }
-
-      if (obj?.error) {
-        const emsg = obj.error?.message || JSON.stringify(obj.error);
-        idToError.set(base, emsg);
-      }
     }
 
-    // 5b) Post-pass: aggressively unwrap {"cols":{...}} still trapped in a "result" string
+    // Unwrap any lingering {"cols":{...}} inside a 'result' string
     for (const [id, cols] of idToCols.entries()) {
       if (cols && typeof cols.result === "string") {
         const maybe = parseResultPossiblyJson(cols.result);
@@ -284,7 +268,7 @@ exports.handler = async (event) => {
       }
     }
 
-    // 6) Decide headers and rows
+    // 6) Build output table
     const resultColSet = new Set();
     for (const [, cols] of idToCols) for (const k of Object.keys(cols)) resultColSet.add(k);
 
@@ -305,10 +289,8 @@ exports.handler = async (event) => {
       const allIds = new Set([
         ...Array.from(idToInput.keys()),
         ...Array.from(idToCols.keys()),
-        ...Array.from(idToError.keys()),
       ]);
       const sortedIds = Array.from(allIds).sort((a, b) => a - b);
-
       headers = ["id", "input_text", ...Array.from(resultColSet)];
       outRows = sortedIds.map(id => {
         const base = { id, input_text: idToInput.get(id) ?? "" };
@@ -322,30 +304,79 @@ exports.handler = async (event) => {
     }
 
     if (!outRows.length) {
-      return res(404, { error: "No rows reconstructed. Check that blobs metadata exists or the batch output contains JSON." });
+      return res(404, { error: "No rows reconstructed." });
     }
 
     // FINAL: remove all CR/LF from every cell (Excel-safe)
     const flattenedRows = flattenNewlines(outRows);
 
+    // Stringify (quoted by default inside csv-stringify when needed)
     const csvStr = await new Promise((resolve, reject) => {
       csvStringify(flattenedRows, { header: true, columns: headers }, (err, out) => {
         if (err) reject(err); else resolve(out);
       });
     });
-    const csvWithBom = ensureUtf8Bom(csvStr);
 
-    // Save a copy for convenience
-    try {
-      await store.set(`results/${batchId}.reconstructed.csv`, csvWithBom, {
-        contentType: "text/csv; charset=utf-8",
-      });
-    } catch {}
+    // Add BOM for Excel
+    let payload = ensureUtf8Bom(csvStr);
+    let buf = Buffer.from(payload, "utf8");
 
-    return res(200, csvWithBom, {
-      "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="${batchId}.csv"`,
-    });
+    // If over ~5.5MB, try gzip
+    const HARD_LIMIT = 6_000_000; // below the 6,291,556 cap to be safe
+    if (buf.length > HARD_LIMIT) {
+      const gz = zlib.gzipSync(buf, { level: zlib.constants.Z_BEST_COMPRESSION });
+      if (gz.length <= HARD_LIMIT) {
+        return {
+          statusCode: 200,
+          headers: {
+            ...CORS,
+            "Content-Type": "text/csv; charset=utf-8",
+            "Content-Disposition": `attachment; filename="${batchId}.csv.gz"`,
+            "Content-Encoding": "gzip",
+          },
+          body: gz.toString("base64"),
+          isBase64Encoded: true,
+        };
+      }
+    }
+
+    // If still too big, write to blobs and redirect to streaming proxy
+    if (buf.length > HARD_LIMIT) {
+      const key = `results/${batchId}.reconstructed.csv`;
+      await store.set(key, buf, { contentType: "text/csv; charset=utf-8" });
+
+      // Build origin for redirect
+      const hdrs = event.headers || {};
+      const host = hdrs["x-forwarded-host"] || hdrs["host"] || hdrs["Host"] || "";
+      const proto = hdrs["x-forwarded-proto"] || (host.startsWith("localhost") ? "http" : "https");
+      const origin = host ? `${proto}://${host}` : (process.env.URL || "http://localhost:8888");
+
+      return {
+        statusCode: 303,
+        headers: {
+          ...CORS,
+          Location: `${origin}/.netlify/functions/blob-proxy?key=${encodeURIComponent(key)}&filename=${encodeURIComponent(batchId + ".csv")}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          redirected: true,
+          download: `/\.netlify/functions/blob-proxy?key=${encodeURIComponent(key)}&filename=${encodeURIComponent(batchId + ".csv")}`,
+          note: "Large file stored in blobs and streamed via proxy.",
+        }),
+      };
+    }
+
+    // Otherwise return inline
+    return {
+      statusCode: 200,
+      headers: {
+        ...CORS,
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="${batchId}.csv"`,
+      },
+      body: payload,
+    };
+
   } catch (e) {
     console.error("batch-reconstruct error:", e);
     return res(500, { error: e.message || String(e) });
