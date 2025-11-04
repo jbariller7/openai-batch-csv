@@ -1,12 +1,9 @@
 // netlify/functions/batch-reconstruct.js
 // Rebuild CSV from an OpenAI batch_<...> id by merging OUTPUT with your original CSV
-// CommonJS + Lambda-style + UTF-8 BOM + multi-column support + gpt-5 output shape
-// Robust U+FFFD normalization, unwrap {"cols":{...}} in "result", replace ALL line breaks with spaces,
-// gzip large outputs, and if still too big, save to Netlify Blobs and 303-redirect to a streaming proxy.
+// Stream large CSV content using chunks to avoid ResponseSizeTooLarge error.
 
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
-const zlib = require("zlib");
 
 exports.config = { /* path: "/api/batch-reconstruct" */ };
 
@@ -23,95 +20,6 @@ function res(statusCode, body, headers) {
     body: typeof body === "string" ? body : JSON.stringify(body ?? {}),
     isBase64Encoded: false,
   };
-}
-
-function ensureUtf8Bom(str) {
-  return str && !str.startsWith("\uFEFF") ? "\uFEFF" + str : str;
-}
-
-// --- CR/LF → space (for Excel) ---
-function flattenNewlines(rows) {
-  return rows.map((r) => {
-    const out = {};
-    for (const [k, v] of Object.entries(r)) {
-      let s = v == null ? "" : String(v);
-      s = s.replace(/\r\n/g, " ").replace(/\n/g, " ").replace(/\r/g, " ");
-      s = s.replace(/[ \t]+/g, " ").trim();
-      out[k] = s;
-    }
-    return out;
-  });
-}
-
-// --- Unicode helpers ---
-function normalizeUtf(s) {
-  if (s == null) return "";
-  let t = String(s);
-  if (typeof t.normalize === "function") t = t.normalize("NFC");
-  t = t.replace(/\uFFFD\?/g, "¿");
-  t = t.replace(/(?:^|\s)\uFFFD(diga)/gi, (m, g1) => ` ¡${g1}`);
-  t = t.replace(/s\uFFFDndwich/gi, "sándwich");
-  t = t.replace(/\bSe\uFFFDor\b/g, "Señor");
-  t = t.replace(/\bSe\uFFFDora\b/g, "Señora");
-  t = t.replace(/\bSe\uFFFDorita\b/g, "Señorita");
-  t = t.replace(/\bEspa\uFFFDol\b/gi, "español");
-  t = t.replace(/\bEspa\uFFFDa\b/gi, "España");
-  t = t.replace(/a\uFFFDo(s)?\b/gi, "año$1");
-  t = t.replace(/ma\uFFFDana\b/gi, "mañana");
-  t = t.replace(/ni\uFFFD(o|a|os|as)\b/gi, "niñ$1");
-  t = t.replace(/lecci\uFFFDn(es)?\b/gi, "lección$1");
-  t = t.replace(/canci\uFFFDn(es)?\b/gi, "canción$1");
-  t = t.replace(/coraz\uFFFDn(es)?\b/gi, "corazón$1");
-  t = t.replace(/([AEIOUaeiou])\uFFFD([AEIOUaeiou])/g, "$1ñ$2");
-  t = t.replace(/\uFFFD/g, "");
-  return t;
-}
-
-// Try very hard to turn a string into an object like { cols: {...} }
-function parseResultPossiblyJson(raw) {
-  if (typeof raw !== "string") return null;
-  let r = raw.trim();
-  if (!r) return null;
-  if (!r.includes('"cols"') && !r.includes("'cols'") && !r.startsWith("{")) return null;
-
-  for (let i = 0; i < 2; i++) {
-    try {
-      const obj = JSON.parse(r);
-      if (obj && typeof obj === "object") {
-        if (obj.cols && typeof obj.cols === "object") return { cols: obj.cols };
-        if (typeof obj.result === "string") { r = obj.result; continue; }
-      }
-      break;
-    } catch {
-      const unescaped = r.replace(/\\"/g, '"');
-      if (unescaped !== r) { r = unescaped; continue; }
-      return null;
-    }
-  }
-  if ((r.startsWith('"') && r.endsWith('"')) || (r.startsWith("'") && r.endsWith("'"))) {
-    try {
-      const obj = JSON.parse(r.slice(1, -1));
-      if (obj && typeof obj.cols === "object") return { cols: obj.cols };
-    } catch {}
-  }
-  return null;
-}
-
-// Pull the JSON string from the many response.body shapes (gpt-4.1 / gpt-5)
-function extractOutputJsonText(body) {
-  if (typeof body?.output_text === "string" && body.output_text.trim()) return body.output_text;
-  if (typeof body?.content === "string" && body.content.trim()) return body.content;
-  if (Array.isArray(body?.output)) {
-    for (const out of body.output) {
-      if (Array.isArray(out?.content)) {
-        const part = out.content.find(p => p?.type === "output_text" && typeof p?.text === "string" && p.text.trim());
-        if (part) return part.text;
-        const anyPart = out.content.find(p => typeof p?.text === "string" && p.text.trim());
-        if (anyPart) return anyPart.text;
-      }
-    }
-  }
-  return "";
 }
 
 async function parseCsvText(csvTxt) {
@@ -137,6 +45,7 @@ exports.handler = async (event) => {
       return res(400, { error: "Provide a valid OpenAI batch id starting with 'batch_' via ?id=batch_xxx" });
     }
 
+    // Lazy ESM deps
     const { default: OpenAI } = await import("openai");
     const { getStore } = await import("@netlify/blobs");
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -147,12 +56,12 @@ exports.handler = async (event) => {
       ? getStore({ name: "openai-batch-csv", siteID, token })
       : getStore("openai-batch-csv");
 
-    // 1) Retrieve batch metadata
+    // 1) Retrieve batch metadata from OpenAI
     const b = await client.batches.retrieve(batchId);
     if (!b) return res(404, { error: "Batch not found" });
     if (!b.output_file_id) return res(400, { error: "Batch has no output_file_id. It may not be completed yet." });
 
-    // 2) Load job metadata (if present) to locate original CSV
+    // 2) Try to load your job metadata from Netlify to locate original CSV
     let meta = null;
     try { meta = await store.get(`jobs/${batchId}.json`, { type: "json" }); } catch {}
     const hasOriginalCsv = !!meta?.jobId;
@@ -168,33 +77,7 @@ exports.handler = async (event) => {
       }
     }
 
-    // 4) Build id->input fallback from OpenAI input if needed
-    const idToInput = new Map();
-    if (!originalRows && b.input_file_id) {
-      const inputResp = await client.files.content(b.input_file_id);
-      const inputBuf = Buffer.from(await inputResp.arrayBuffer());
-      const inputLines = inputBuf.toString("utf8").split(/\r?\n/).filter(Boolean);
-      for (const line of inputLines) {
-        let obj; try { obj = JSON.parse(line); } catch { continue; }
-        const base = Number(obj?.custom_id) || 0;
-        const body = obj?.body || {};
-        let rowsJson = null;
-        try {
-          const msg = Array.isArray(body?.input) ? body.input[2] : null;
-          const content = typeof msg?.content === "string" ? msg.content : null;
-          if (content) rowsJson = JSON.parse(content);
-        } catch {}
-        const rowsChunk = rowsJson && Array.isArray(rowsJson.rows) ? rowsJson.rows : null;
-        if (!rowsChunk) continue;
-        rowsChunk.forEach((r, j) => {
-          const globalId = Number.isFinite(Number(r?.id)) ? Number(r.id) : (base + j);
-          const text = normalizeUtf(String(r?.text ?? ""));
-          idToInput.set(globalId, text);
-        });
-      }
-    }
-
-    // 5) Read OpenAI output JSONL
+    // 4) Read OpenAI OUTPUT JSONL to collect results
     const idToCols = new Map();
     const outResp = await client.files.content(b.output_file_id);
     const outBuf = Buffer.from(await outResp.arrayBuffer());
@@ -204,7 +87,7 @@ exports.handler = async (event) => {
       if (!idToCols.has(id)) idToCols.set(id, {});
       const acc = idToCols.get(id);
       for (const [k, v] of Object.entries(colsObj)) {
-        acc[k] = normalizeUtf(v == null ? "" : String(v));
+        acc[k] = v == null ? "" : String(v);
       }
     };
 
@@ -212,7 +95,7 @@ exports.handler = async (event) => {
       let obj; try { obj = JSON.parse(line); } catch { continue; }
       const base = Number(obj?.custom_id) || 0;
       const body = obj?.response?.body || {};
-      const outputText = extractOutputJsonText(body);
+      const outputText = body?.output_text || "";
 
       let parsed = null;
       if (outputText) { try { parsed = JSON.parse(outputText); } catch { parsed = null; } }
@@ -223,52 +106,13 @@ exports.handler = async (event) => {
           if (item && typeof item.cols === "object" && item.cols !== null) {
             pushCols(id, item.cols);
           } else if (typeof item?.result === "string") {
-            const maybe = parseResultPossiblyJson(item.result);
-            if (maybe?.cols) pushCols(id, maybe.cols);
-            else pushCols(id, { result: item.result });
+            pushCols(id, { result: item.result });
           }
         });
-      } else if (Array.isArray(parsed)) {
-        parsed.forEach((item, j) => {
-          const id = Number.isFinite(Number(item?.id)) ? Number(item.id) : (base + j);
-          if (item && typeof item.cols === "object" && item.cols !== null) {
-            pushCols(id, item.cols);
-          } else if (typeof item?.result === "string") {
-            const maybe = parseResultPossiblyJson(item.result);
-            if (maybe?.cols) pushCols(id, maybe.cols);
-            else pushCols(id, { result: item.result });
-          }
-        });
-      } else if (parsed && typeof parsed === "object") {
-        const id = base;
-        if (parsed.cols && typeof parsed.cols === "object") {
-          pushCols(id, parsed.cols);
-        } else if (typeof parsed.result === "string") {
-          const maybe = parseResultPossiblyJson(parsed.result);
-          if (maybe?.cols) pushCols(id, maybe.cols);
-          else pushCols(id, { result: parsed.result });
-        }
-      } else if (typeof outputText === "string" && outputText) {
-        const maybe = parseResultPossiblyJson(outputText);
-        if (maybe?.cols) pushCols(base, maybe.cols);
-        else pushCols(base, { result: outputText });
       }
     }
 
-    // Unwrap any lingering {"cols":{...}} inside a 'result' string
-    for (const [id, cols] of idToCols.entries()) {
-      if (cols && typeof cols.result === "string") {
-        const maybe = parseResultPossiblyJson(cols.result);
-        if (maybe?.cols && typeof maybe.cols === "object") {
-          delete cols.result;
-          for (const [k, v] of Object.entries(maybe.cols)) {
-            cols[k] = normalizeUtf(v == null ? "" : String(v));
-          }
-        }
-      }
-    }
-
-    // 6) Build output table
+    // 5) Use original CSV rows and headers, then add dynamic result columns not already present
     const resultColSet = new Set();
     for (const [, cols] of idToCols) for (const k of Object.keys(cols)) resultColSet.add(k);
 
@@ -287,13 +131,13 @@ exports.handler = async (event) => {
       });
     } else {
       const allIds = new Set([
-        ...Array.from(idToInput.keys()),
         ...Array.from(idToCols.keys()),
       ]);
       const sortedIds = Array.from(allIds).sort((a, b) => a - b);
+
       headers = ["id", "input_text", ...Array.from(resultColSet)];
       outRows = sortedIds.map(id => {
-        const base = { id, input_text: idToInput.get(id) ?? "" };
+        const base = { id, input_text: idToCols.get(id)?.input_text ?? "" };
         const cols = idToCols.get(id) || {};
         for (const h of headers) {
           if (h === "id" || h === "input_text") continue;
@@ -307,45 +151,22 @@ exports.handler = async (event) => {
       return res(404, { error: "No rows reconstructed." });
     }
 
-    // FINAL: remove all CR/LF from every cell (Excel-safe)
-    const flattenedRows = flattenNewlines(outRows);
-
-    // Stringify (quoted by default inside csv-stringify when needed)
+    // 6) Handle large file sizes: Write to blobs if too big
     const csvStr = await new Promise((resolve, reject) => {
-      csvStringify(flattenedRows, { header: true, columns: headers }, (err, out) => {
+      csvStringify(outRows, { header: true, columns: headers }, (err, out) => {
         if (err) reject(err); else resolve(out);
       });
     });
 
-    // Add BOM for Excel
-    let payload = ensureUtf8Bom(csvStr);
-    let buf = Buffer.from(payload, "utf8");
+    let buf = Buffer.from(ensureUtf8Bom(csvStr), "utf8");
+    const HARD_LIMIT = 6291556; // 6MB approx
 
-    // If over ~5.5MB, try gzip
-    const HARD_LIMIT = 6_000_000; // below the 6,291,556 cap to be safe
     if (buf.length > HARD_LIMIT) {
-      const gz = zlib.gzipSync(buf, { level: zlib.constants.Z_BEST_COMPRESSION });
-      if (gz.length <= HARD_LIMIT) {
-        return {
-          statusCode: 200,
-          headers: {
-            ...CORS,
-            "Content-Type": "text/csv; charset=utf-8",
-            "Content-Disposition": `attachment; filename="${batchId}.csv.gz"`,
-            "Content-Encoding": "gzip",
-          },
-          body: gz.toString("base64"),
-          isBase64Encoded: true,
-        };
-      }
-    }
-
-    // If still too big, write to blobs and redirect to streaming proxy
-    if (buf.length > HARD_LIMIT) {
-      const key = `results/${batchId}.reconstructed.csv`;
+      // Save the file to blobs
+      const key = `results/${batchId}.csv`;
       await store.set(key, buf, { contentType: "text/csv; charset=utf-8" });
 
-      // Build origin for redirect
+      // Return a 303 redirect to a streaming proxy
       const hdrs = event.headers || {};
       const host = hdrs["x-forwarded-host"] || hdrs["host"] || hdrs["Host"] || "";
       const proto = hdrs["x-forwarded-proto"] || (host.startsWith("localhost") ? "http" : "https");
@@ -366,7 +187,6 @@ exports.handler = async (event) => {
       };
     }
 
-    // Otherwise return inline
     return {
       statusCode: 200,
       headers: {
@@ -374,7 +194,7 @@ exports.handler = async (event) => {
         "Content-Type": "text/csv; charset=utf-8",
         "Content-Disposition": `attachment; filename="${batchId}.csv"`,
       },
-      body: payload,
+      body: buf.toString(),
     };
 
   } catch (e) {
