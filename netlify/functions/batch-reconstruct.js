@@ -3,6 +3,9 @@
 // CommonJS + Lambda-style + UTF-8 BOM + multi-column support + gpt-5 output shape
 // Robust U+FFFD normalization (Se\uFFFDor → Señor). Replaces ALL line breaks with spaces.
 // Aggressively unwraps cases where a whole JSON string like {"cols":{...}} lands in "result".
+// Now also:
+// - Repairs common malformed JSON from models (bad backslashes, missing final "}", stray commas).
+// - Supports {"results":{id, cols:{...}}} as well as array shapes.
 
 const { parse: csvParse } = require("csv-parse");
 const { stringify: csvStringify } = require("csv-stringify");
@@ -65,6 +68,76 @@ function normalizeUtf(s) {
   return t;
 }
 
+// --- JSON repair helper ---
+// Tries very hard to parse model output that is "almost" JSON:
+// - Fixes invalid backslashes (\C[4] etc.)
+// - Removes trailing commas
+// - Balances braces/brackets to fix missing final }
+// - Cuts off trailing junk after last } or ]
+function tryParseJsonWithRepairs(raw) {
+  if (raw == null) return null;
+  let s = String(raw).trim();
+  if (!s) return null;
+
+  const attemptParse = (text) => {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  };
+
+  let obj = attemptParse(s);
+  if (obj) return obj;
+
+  // Step 1: escape invalid backslashes (e.g., \C[4] → \\C[4])
+  // Matches a backslash not preceded by "\" and not followed by a valid escape char.
+  let fixed = s.replace(/(?<!\\)\\(?!["\\/bfnrtu])/g, "\\\\");
+  if (fixed !== s) {
+    obj = attemptParse(fixed);
+    if (obj) return obj;
+    s = fixed;
+  }
+
+  // Step 2: remove trailing commas before } or ]
+  fixed = s.replace(/,\s*([}\]])/g, "$1");
+  if (fixed !== s) {
+    obj = attemptParse(fixed);
+    if (obj) return obj;
+    s = fixed;
+  }
+
+  // Step 3: balance braces and brackets (fix missing last } or ])
+  const balance = (text, openChar, closeChar) => {
+    const openCount = (text.match(new RegExp("\\" + openChar, "g")) || []).length;
+    const closeCount = (text.match(new RegExp("\\" + closeChar, "g")) || []).length;
+    if (openCount > closeCount) {
+      return text + closeChar.repeat(openCount - closeCount);
+    }
+    return text;
+  };
+
+  fixed = balance(s, "{", "}");
+  fixed = balance(fixed, "[", "]");
+  if (fixed !== s) {
+    obj = attemptParse(fixed);
+    if (obj) return obj;
+    s = fixed;
+  }
+
+  // Step 4: cut off trailing garbage after the last } or ]
+  const lastCurly = s.lastIndexOf("}");
+  const lastBracket = s.lastIndexOf("]");
+  const lastPos = Math.max(lastCurly, lastBracket);
+  if (lastPos > 0 && lastPos < s.length - 1) {
+    fixed = s.slice(0, lastPos + 1);
+    obj = attemptParse(fixed);
+    if (obj) return obj;
+  }
+
+  return null;
+}
+
 // Try very hard to turn a string into an object like { cols: {...} }
 function parseResultPossiblyJson(raw) {
   if (typeof raw !== "string") return null;
@@ -76,30 +149,32 @@ function parseResultPossiblyJson(raw) {
 
   // Attempt up to two parses (handles double-encoded strings)
   for (let i = 0; i < 2; i++) {
-    try {
-      const obj = JSON.parse(r);
-      if (obj && typeof obj === "object") {
-        if (obj.cols && typeof obj.cols === "object") return { cols: obj.cols };
-        // Some models wrap again: { result: "{\"cols\":{...}}" }
-        if (typeof obj.result === "string") {
-          r = obj.result;
-          continue;
-        }
+    const obj = tryParseJsonWithRepairs(r);
+    if (obj && typeof obj === "object") {
+      if (obj.cols && typeof obj.cols === "object") return { cols: obj.cols };
+      // Some models wrap again: { result: "{\"cols\":{...}}" }
+      if (typeof obj.result === "string") {
+        r = obj.result;
+        continue;
       }
-      break;
-    } catch {
-      // If the string is quoted JSON with heavy escaping, try a light unescape of \" → "
-      const unescaped = r.replace(/\\"/g, '"');
-      if (unescaped !== r) { r = unescaped; continue; }
-      return null;
     }
+
+    // If we did not manage to parse yet and this is the first loop,
+    // try a light unescape of \" → " and retry.
+    if (i === 0) {
+      const unescaped = r.replace(/\\"/g, '"');
+      if (unescaped !== r) {
+        r = unescaped;
+        continue;
+      }
+    }
+    break;
   }
   // Last-chance: strip outer quotes if present and try once
   if ((r.startsWith('"') && r.endsWith('"')) || (r.startsWith("'") && r.endsWith("'"))) {
-    try {
-      const obj = JSON.parse(r.slice(1, -1));
-      if (obj && typeof obj.cols === "object") return { cols: obj.cols };
-    } catch {}
+    const inner = r.slice(1, -1);
+    const obj = tryParseJsonWithRepairs(inner);
+    if (obj && obj.cols && typeof obj.cols === "object") return { cols: obj.cols };
   }
   return null;
 }
@@ -111,9 +186,11 @@ function extractOutputJsonText(body) {
   if (Array.isArray(body?.output)) {
     for (const out of body.output) {
       if (Array.isArray(out?.content)) {
-        const part = out.content.find(p => p?.type === "output_text" && typeof p?.text === "string" && p.text.trim());
+        const part = out.content.find(
+          (p) => p?.type === "output_text" && typeof p?.text === "string" && p.text.trim()
+        );
         if (part) return part.text;
-        const anyPart = out.content.find(p => typeof p?.text === "string" && p.text.trim());
+        const anyPart = out.content.find((p) => typeof p?.text === "string" && p.text.trim());
         if (anyPart) return anyPart.text;
       }
     }
@@ -125,7 +202,7 @@ async function parseCsvText(csvTxt) {
   return new Promise((resolve, reject) => {
     const out = [];
     csvParse(csvTxt, { columns: true, relax_quotes: true, bom: true, skip_empty_lines: true })
-      .on("data", r => out.push(r))
+      .on("data", (r) => out.push(r))
       .on("end", () => resolve(out))
       .on("error", reject);
   });
@@ -151,8 +228,8 @@ exports.handler = async (event) => {
 
     // Optional manual creds for local/dev
     const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
-    const token  = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
-    const store  = (siteID && token)
+    const token = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
+    const store = siteID && token
       ? getStore({ name: "openai-batch-csv", siteID, token })
       : getStore("openai-batch-csv");
 
@@ -163,7 +240,9 @@ exports.handler = async (event) => {
 
     // 2) Try to load your job metadata from Netlify to locate original CSV
     let meta = null;
-    try { meta = await store.get(`jobs/${batchId}.json`, { type: "json" }); } catch {}
+    try {
+      meta = await store.get(`jobs/${batchId}.json`, { type: "json" });
+    } catch {}
     const hasOriginalCsv = !!meta?.jobId;
 
     // 3) If we have original CSV, load it
@@ -184,7 +263,12 @@ exports.handler = async (event) => {
       const inputBuf = Buffer.from(await inputResp.arrayBuffer());
       const inputLines = inputBuf.toString("utf8").split(/\r?\n/).filter(Boolean);
       for (const line of inputLines) {
-        let obj; try { obj = JSON.parse(line); } catch { continue; }
+        let obj;
+        try {
+          obj = JSON.parse(line);
+        } catch {
+          continue;
+        }
         const base = Number(obj?.custom_id) || 0;
         const body = obj?.body || {};
         let rowsJson = null;
@@ -196,7 +280,7 @@ exports.handler = async (event) => {
         const rowsChunk = rowsJson && Array.isArray(rowsJson.rows) ? rowsJson.rows : null;
         if (!rowsChunk) continue;
         rowsChunk.forEach((r, j) => {
-          const globalId = Number.isFinite(Number(r?.id)) ? Number(r.id) : (base + j);
+          const globalId = Number.isFinite(Number(r?.id)) ? Number(r.id) : base + j;
           const text = normalizeUtf(String(r?.text ?? ""));
           idToInput.set(globalId, text);
         });
@@ -219,17 +303,25 @@ exports.handler = async (event) => {
     };
 
     for (const line of outLines) {
-      let obj; try { obj = JSON.parse(line); } catch { continue; }
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        continue;
+      }
       const base = Number(obj?.custom_id) || 0;
       const body = obj?.response?.body || {};
       const outputText = extractOutputJsonText(body);
 
       let parsed = null;
-      if (outputText) { try { parsed = JSON.parse(outputText); } catch { parsed = null; } }
+      if (outputText) {
+        parsed = tryParseJsonWithRepairs(outputText);
+      }
 
       if (parsed && Array.isArray(parsed.results)) {
+        // Standard shape: { results: [ {id, cols} , ... ] }
         parsed.results.forEach((item, j) => {
-          const id = Number.isFinite(Number(item?.id)) ? Number(item.id) : (base + j);
+          const id = Number.isFinite(Number(item?.id)) ? Number(item.id) : base + j;
           if (item && typeof item.cols === "object" && item.cols !== null) {
             pushCols(id, item.cols);
           } else if (typeof item?.result === "string") {
@@ -238,9 +330,21 @@ exports.handler = async (event) => {
             else pushCols(id, { result: item.result });
           }
         });
+      } else if (parsed && parsed.results && typeof parsed.results === "object" && !Array.isArray(parsed.results)) {
+        // New shape you mentioned: { results: { id: ..., cols: {...} } }
+        const item = parsed.results;
+        const id = Number.isFinite(Number(item?.id)) ? Number(item.id) : base;
+        if (item && typeof item.cols === "object" && item.cols !== null) {
+          pushCols(id, item.cols);
+        } else if (typeof item?.result === "string") {
+          const maybe = parseResultPossiblyJson(item.result);
+          if (maybe?.cols) pushCols(id, maybe.cols);
+          else pushCols(id, { result: item.result });
+        }
       } else if (Array.isArray(parsed)) {
+        // Parsed is a bare array of {id, cols}
         parsed.forEach((item, j) => {
-          const id = Number.isFinite(Number(item?.id)) ? Number(item.id) : (base + j);
+          const id = Number.isFinite(Number(item?.id)) ? Number(item.id) : base + j;
           if (item && typeof item.cols === "object" && item.cols !== null) {
             pushCols(id, item.cols);
           } else if (typeof item?.result === "string") {
@@ -250,6 +354,7 @@ exports.handler = async (event) => {
           }
         });
       } else if (parsed && typeof parsed === "object") {
+        // Single object with cols directly, or { result: "..." }
         const id = base;
         if (parsed.cols && typeof parsed.cols === "object") {
           pushCols(id, parsed.cols);
@@ -292,7 +397,7 @@ exports.handler = async (event) => {
     let outRows = [];
 
     if (originalRows && originalRows.length) {
-      const dynamicHeaders = Array.from(resultColSet).filter(h => !originalHeaders.includes(h));
+      const dynamicHeaders = Array.from(resultColSet).filter((h) => !originalHeaders.includes(h));
       headers = [...originalHeaders, ...dynamicHeaders];
 
       outRows = originalRows.map((orig, idx) => {
@@ -310,14 +415,14 @@ exports.handler = async (event) => {
       const sortedIds = Array.from(allIds).sort((a, b) => a - b);
 
       headers = ["id", "input_text", ...Array.from(resultColSet)];
-      outRows = sortedIds.map(id => {
-        const base = { id, input_text: idToInput.get(id) ?? "" };
+      outRows = sortedIds.map((id) => {
+        const baseRow = { id, input_text: idToInput.get(id) ?? "" };
         const cols = idToCols.get(id) || {};
         for (const h of headers) {
           if (h === "id" || h === "input_text") continue;
-          base[h] = cols[h] ?? "";
+          baseRow[h] = cols[h] ?? "";
         }
-        return base;
+        return baseRow;
       });
     }
 
@@ -330,7 +435,8 @@ exports.handler = async (event) => {
 
     const csvStr = await new Promise((resolve, reject) => {
       csvStringify(flattenedRows, { header: true, columns: headers }, (err, out) => {
-        if (err) reject(err); else resolve(out);
+        if (err) reject(err);
+        else resolve(out);
       });
     });
     const csvWithBom = ensureUtf8Bom(csvStr);
