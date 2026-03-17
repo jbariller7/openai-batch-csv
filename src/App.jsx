@@ -11,8 +11,8 @@ export default function App() {
   const [file, setFile] = useState(null);
   const [inputCol, setInputCol] = useState("text");
   const [prompt, setPrompt] = useState("Translate the user input into English.");
-  const [model, setModel] = useState("gpt-4.1-mini");
-  const [chunkSize, setChunkSize] = useState(200); // rows per request (K)
+const [model, setModel] = useState("gpt-5-nano");
+  const [chunkSize, setChunkSize] = useState(500); // Increased default K for better token efficiency
   const [reasoningEffort, setReasoningEffort] = useState("medium"); // minimal|low|medium|high
 
   const [mode, setMode] = useState("batch"); // "batch" | "dry" | "direct"
@@ -347,15 +347,18 @@ export default function App() {
                         placeholder="Describe what to do with each row..." />
             </label>
 
-            <label>Model
+<label>Model
               <select value={model} onChange={(e) => setModel(e.target.value)}>
-                {/* Add GPT-5 options if your org has access */}
-                <option>gpt-5</option>
-                <option>gpt-5-mini</option>
-                <option>gpt-5-nano</option>
-                <option>gpt-4.1-mini</option>
-                <option>gpt-4o-mini</option>
-                <option>gpt-4.1</option>
+                <optgroup label="Current Generation (Lowest Cost)">
+                  <option value="gpt-5-nano">gpt-5-nano (Cheapest - Best for simple extraction)</option>
+                  <option value="gpt-5-mini">gpt-5-mini (Balanced - Good for reasoning)</option>
+                  <option value="gpt-5">gpt-5 (Flagship - Most expensive, highest IQ)</option>
+                </optgroup>
+                <optgroup label="Legacy Models">
+                  <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+                  <option value="gpt-4o-mini">gpt-4o-mini</option>
+                  <option value="gpt-4.1">gpt-4.1</option>
+                </optgroup>
               </select>
             </label>
 
@@ -381,11 +384,11 @@ export default function App() {
             </label>
 
             <div style={{ display: "grid", gap: 8 }}>
-              <label>Mode
+<label>Mode (Strategy)
                 <select value={mode} onChange={(e) => setMode(e.target.value)}>
-                  <option value="batch">Batch (slow, cheapest at scale)</option>
-                  <option value="dry">Dry run (first chunk now)</option>
-                  <option value="direct">Direct (process all now)</option>
+                  <option value="batch">Batch API (50% Cost Discount - 24h wait)</option>
+                  <option value="direct">Direct API (Instant - Standard Price)</option>
+                  <option value="dry">Dry run (Test 1 chunk instantly)</option>
                 </select>
               </label>
 
