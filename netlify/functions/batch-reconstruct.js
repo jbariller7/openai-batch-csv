@@ -97,7 +97,6 @@ exports.handler = async (event) => {
 
       for (const line of outLines) {
         let obj; try { obj = JSON.parse(line); } catch { continue; }
-        // CRITICAL FIX: Base index parsing
         const base = parseInt(obj?.custom_id, 10) || 0;
         const text = extractOutputJsonText(obj?.response?.body);
         let parsed = text ? tryParseJsonWithRepairs(text) : null;
@@ -136,6 +135,7 @@ exports.handler = async (event) => {
     const resultColSet = new Set();
     for (const cols of idToCols.values()) for (const k of Object.keys(cols)) resultColSet.add(k);
     
+    // CRITICAL FIX: Only add dynamic headers that aren't already in the CSV
     const originalHeaders = Object.keys(originalRows[0] || {});
     const dynamicHeaders = Array.from(resultColSet).filter(h => !originalHeaders.includes(h));
     const headers = [...originalHeaders, ...dynamicHeaders];
@@ -145,21 +145,27 @@ exports.handler = async (event) => {
       const row = { ...orig };
       const cols = idToCols.get(idx) || {};
       
+      // CRITICAL FIX: Explicitly merge the AI's output into the row first!
+      for (const [k, v] of Object.entries(cols)) {
+         if (v !== undefined && v !== null && String(v).trim() !== "") {
+             row[k] = String(v); 
+         }
+      }
+      
       const targetInputText = String(orig[meta.inputCol] || "").trim();
       const skipText = meta.skipCol ? String(orig[meta.skipCol] || "").trim() : "";
       
       if (targetInputText && !skipText) {
           let isMissing = false;
-          // IF Target columns were defined, check that EVERY specific column was returned by the AI!
           if (meta.targetCols && meta.targetCols.length > 0) {
-              isMissing = meta.targetCols.some(c => !cols[c] || String(cols[c]).trim() === "");
+              // Check the MERGED row to see if every required column is populated
+              isMissing = meta.targetCols.some(c => !row[c] || String(row[c]).trim() === "");
           } else {
               isMissing = (!idToCols.has(idx) || Object.keys(cols).length === 0);
           }
           if (isMissing) missingIds.push(idx);
       }
 
-      for (const h of dynamicHeaders) row[h] = cols[h] ?? "";
       return row;
     });
 
