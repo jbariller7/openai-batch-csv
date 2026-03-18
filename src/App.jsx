@@ -18,14 +18,14 @@ function highlightJSON(json) {
 
 function ProjectWorkspace({ project, updateProject, isActive }) {
   const { 
-    id, name, inputCol, skipCol, prompt, contextDoc, model, chunkSize, reasoningEffort, mode, 
+    id, name, inputCol, skipCol, targetCols, prompt, contextDoc, model, chunkSize, reasoningEffort, mode, 
     concurrency, maxRows, batchIds, status, jobStats, analysis, lastRunMode 
   } = project;
 
   const [file, setFile] = useState(null);
   const [isDragging, setIsDragging] = useState(false);
   const [importId, setImportId] = useState("");
-  const [batchIdInput, setBatchIdInput] = useState(batchIds.join(", "));
+  const [batchIdInput, setBatchIdInput] = useState(batchIds.join(",\n")); // Use newlines for bigger box
   
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -43,8 +43,7 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
   function log(msg) { setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]); }
   useEffect(() => { if (logRef.current && consoleOpen) logRef.current.scrollTop = logRef.current.scrollHeight; }, [logs, consoleOpen]);
 
-  // Keep internal text input synced with global batch array
-  useEffect(() => { setBatchIdInput(batchIds.join(", ")); }, [batchIds]);
+  useEffect(() => { setBatchIdInput(batchIds.join(",\n")); }, [batchIds]);
 
   const pollRef = useRef(null);
   function stopPolling() { if (pollRef.current) clearInterval(pollRef.current); pollRef.current = null; }
@@ -83,6 +82,7 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
       fd.append("file", file); fd.append("inputCol", inputCol); fd.append("prompt", prompt);
       fd.append("model", model); fd.append("chunkSize", chunkSize); fd.append("reasoning_effort", reasoningEffort);
       if (skipCol) fd.append("skipCol", skipCol);
+      if (targetCols) fd.append("targetCols", targetCols);
       if (contextDoc) fd.append("contextDoc", contextDoc);
       if (maxRows) fd.append("maxRows", maxRows);
       if (mode === "dry") fd.append("dryRun", "1");
@@ -156,7 +156,7 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || "Analysis failed.");
       update({ analysis: j });
-      log(`Analysis complete. Found ${j.missingCount} missing rows.`);
+      log(`Analysis complete. Found ${j.missingCount} missing rows/cells.`);
     } catch (e) { setError(e.message); } finally { setIsAnalyzing(false); }
   }
 
@@ -172,7 +172,6 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || "Repair failed.");
       
-      // Update batch IDs array, and clear old analysis so user knows to re-run it
       update({ batchIds: [...batchIds, j.newBatchId], status: "submitted", analysis: null, lastRunMode: "batch" });
       log(`✅ Repair batch submitted! ID: ${j.newBatchId}`);
     } catch(e) { setError(e.message); log(`❌ Repair Error: ${e.message}`); } finally { setIsRepairing(false); }
@@ -185,7 +184,6 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
   return (
     <div style={{ display: isActive ? 'block' : 'none' }}>
       
-      {/* Editable Project Name Header */}
       <input 
         className="project-name-input" 
         value={name} 
@@ -201,7 +199,7 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
               <summary>View / Edit Job Configuration</summary>
               <div style={{padding: "0 24px 24px 24px"}}>
                 <p style={{fontSize: 13, color: "#666"}}><em>Note: Changing these settings does not affect the currently running batch.</em></p>
-                <ConfigForm file={file} setFile={setFile} isDragging={isDragging} setIsDragging={setIsDragging} update={update} inputCol={inputCol} skipCol={skipCol} prompt={prompt} contextDoc={contextDoc} model={model} chunkSize={chunkSize} mode={mode} maxRows={maxRows} concurrency={concurrency} isCachedHit={isCachedHit} estTokens={estTokens} barWidth={barWidth} submitBatch={submitBatch} isSubmitting={isSubmitting} />
+                <ConfigForm file={file} setFile={setFile} isDragging={isDragging} setIsDragging={setIsDragging} update={update} inputCol={inputCol} skipCol={skipCol} targetCols={targetCols} prompt={prompt} contextDoc={contextDoc} model={model} chunkSize={chunkSize} mode={mode} maxRows={maxRows} concurrency={concurrency} isCachedHit={isCachedHit} estTokens={estTokens} barWidth={barWidth} submitBatch={submitBatch} isSubmitting={isSubmitting} />
               </div>
             </details>
           ) : (
@@ -211,16 +209,15 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
                 <input value={importId} onChange={e=>setImportId(e.target.value)} placeholder="Or import existing Batch ID..." />
                 <button type="submit" className="secondary">Track</button>
               </form>
-              <ConfigForm file={file} setFile={setFile} isDragging={isDragging} setIsDragging={setIsDragging} update={update} inputCol={inputCol} skipCol={skipCol} prompt={prompt} contextDoc={contextDoc} model={model} chunkSize={chunkSize} mode={mode} maxRows={maxRows} concurrency={concurrency} isCachedHit={isCachedHit} estTokens={estTokens} barWidth={barWidth} submitBatch={submitBatch} isSubmitting={isSubmitting} />
+              <ConfigForm file={file} setFile={setFile} isDragging={isDragging} setIsDragging={setIsDragging} update={update} inputCol={inputCol} skipCol={skipCol} targetCols={targetCols} prompt={prompt} contextDoc={contextDoc} model={model} chunkSize={chunkSize} mode={mode} maxRows={maxRows} concurrency={concurrency} isCachedHit={isCachedHit} estTokens={estTokens} barWidth={barWidth} submitBatch={submitBatch} isSubmitting={isSubmitting} />
             </div>
           )}
 
           {/* ANALYSIS & REPAIR CARD */}
-          {/* Always show this card if there are batches linked to this project! */}
           {isJobActive && (
             <div className="card" style={{ marginTop: "24px" }}>
               <h2>Data Analysis & Repair</h2>
-              <p style={{ fontSize: 13, color: "#555" }}>Check for dropped rows across all tracked batches.</p>
+              <p style={{ fontSize: 13, color: "#555" }}>Check for dropped rows/cells across all tracked batches.</p>
               
               <button onClick={handleAnalyze} disabled={isAnalyzing || status === "running" || status === "submitted"} style={{ width: "100%", marginBottom: 16 }}>
                 {isAnalyzing ? "Analyzing Data..." : "Analyze Extracted Data"}
@@ -230,12 +227,12 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
                 <div style={{ borderTop: "1px solid #eee", paddingTop: 16 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
                     <div><h3 style={{ margin: "0 0 4px 0", fontSize: 16 }}>Results</h3><span style={{ fontSize: 13, color: "#555" }}>Processed {analysis.totalRows} rows.</span></div>
-                    {analysis.missingCount === 0 ? <span className="badge success">100% Complete</span> : <span className="badge danger">{analysis.missingCount} Missing Rows</span>}
+                    {analysis.missingCount === 0 ? <span className="badge success">100% Complete</span> : <span className="badge danger">{analysis.missingCount} Missing Rows/Cells</span>}
                   </div>
 
                   {analysis.missingCount > 0 && (
                     <div style={{ background: "#fff5f5", border: "1px solid #fecaca", padding: 16, borderRadius: 8, marginBottom: 16 }}>
-                      <p style={{ margin: "0 0 12px 0", fontSize: 13, color: "#991b1b" }}>OpenAI dropped <strong>{analysis.missingCount}</strong> rows. Resubmit these specific rows as a new repair batch.</p>
+                      <p style={{ margin: "0 0 12px 0", fontSize: 13, color: "#991b1b" }}>OpenAI dropped data for <strong>{analysis.missingCount}</strong> rows. Resubmit these specific rows as a new repair batch.</p>
                       <button className="danger" onClick={handleRepair} disabled={isRepairing} style={{width: "100%"}}>{isRepairing ? "Creating..." : "Launch Auto-Repair Batch"}</button>
                     </div>
                   )}
@@ -265,13 +262,13 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
               {isJobActive && (
                 <div style={{ marginBottom: 16 }}>
                   
-                  {/* Editable Batch IDs field */}
                   <div className="form-group" style={{background: "#f8fafc", padding: "12px", borderRadius: "8px", border: "1px solid #e2e8f0"}}>
                     <label style={{fontSize: 12, color: "#475569"}}>Tracked Batch IDs (Output will be merged)</label>
-                    <input 
+                    <textarea 
+                      rows={4}
                       value={batchIdInput}
                       onChange={(e) => setBatchIdInput(e.target.value)}
-                      onBlur={() => update({ batchIds: batchIdInput.split(",").map(s=>s.trim()).filter(Boolean) })}
+                      onBlur={() => update({ batchIds: batchIdInput.split(/[,\n]+/).map(s=>s.trim()).filter(Boolean) })}
                       style={{fontFamily: "monospace", fontSize: 12, padding: "8px", marginTop: "4px"}}
                     />
                   </div>
@@ -308,8 +305,7 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
   );
 }
 
-// Separate component isolates the file input Ref!
-function ConfigForm({ file, setFile, isDragging, setIsDragging, update, inputCol, skipCol, prompt, contextDoc, model, chunkSize, mode, maxRows, concurrency, isCachedHit, estTokens, barWidth, submitBatch, isSubmitting }) {
+function ConfigForm({ file, setFile, isDragging, setIsDragging, update, inputCol, skipCol, targetCols, prompt, contextDoc, model, chunkSize, mode, maxRows, concurrency, isCachedHit, estTokens, barWidth, submitBatch, isSubmitting }) {
   const fileInputRef = useRef(null);
 
   return (
@@ -324,8 +320,17 @@ function ConfigForm({ file, setFile, isDragging, setIsDragging, update, inputCol
         <div><label>Skip Column (Optional) <span className="hint">Skip row if this column has data</span></label><input value={skipCol} onChange={(e) => update({skipCol: e.target.value})} placeholder="e.g. result" /></div>
       </div>
 
+      <div className="form-group">
+        <label>Multi-Column Targets (Optional) <span className="hint">Comma separated list (e.g. French, Spanish, German). Processes 1 cell at a time.</span></label>
+        <input value={targetCols || ""} onChange={(e) => update({targetCols: e.target.value})} placeholder="e.g. French, Spanish" />
+      </div>
+
       <div className="form-group"><label>Reference Context (Optional) <span className="hint">Paste large data here to trigger 50% Prompt Caching discount.</span></label><textarea rows={3} value={contextDoc} onChange={(e) => update({contextDoc: e.target.value})} /></div>
-      <div className="form-group"><label>Instruction Prompt</label><textarea rows={4} value={prompt} onChange={(e) => update({prompt: e.target.value})} required /></div>
+      
+      <div className="form-group">
+        <label>Instruction Prompt <span className="hint">Use <strong>{"${columnName}"}</strong> as a variable if using Multi-Column Targets.</span></label>
+        <textarea rows={4} value={prompt} onChange={(e) => update({prompt: e.target.value})} placeholder="Translate the text to ${columnName}" required />
+      </div>
 
       <div className="form-group" style={{ background: "#f8fafc", padding: "12px", borderRadius: "8px", border: "1px solid #e2e8f0" }}>
         <div style={{display: "flex", justifyContent: "space-between"}}><label style={{margin:0}}>System Prompt Size</label>{isCachedHit && <span className="cached-badge">✓ Caching Active</span>}</div>
@@ -357,14 +362,14 @@ export default function App() {
   const [projects, setProjects] = useState(() => {
     const saved = localStorage.getItem("batch-csv-projects");
     if (saved) { try { return JSON.parse(saved); } catch (e) {} }
-    return [{ id: generateId(), name: "New Project", inputCol: "text", skipCol: "", prompt: "Translate the user input into English.", contextDoc: "", model: "gpt-5.4-nano", chunkSize: 500, reasoningEffort: "medium", mode: "batch", concurrency: 4, maxRows: "", batchIds: [], status: "", jobStats: { completed: 0, total: 0 }, analysis: null, lastRunMode: "batch" }];
+    return [{ id: generateId(), name: "New Project", inputCol: "text", skipCol: "", targetCols: "", prompt: "Translate the user input into English.", contextDoc: "", model: "gpt-5.4-nano", chunkSize: 500, reasoningEffort: "medium", mode: "batch", concurrency: 4, maxRows: "", batchIds: [], status: "", jobStats: { completed: 0, total: 0 }, analysis: null, lastRunMode: "batch" }];
   });
   const [activeId, setActiveId] = useState(projects[0]?.id);
 
   useEffect(() => { localStorage.setItem("batch-csv-projects", JSON.stringify(projects)); }, [projects]);
 
   const addProject = () => {
-    const p = { id: generateId(), name: "New Project", inputCol: "text", skipCol: "", prompt: "Translate...", contextDoc: "", model: "gpt-5.4-nano", chunkSize: 500, reasoningEffort: "medium", mode: "batch", concurrency: 4, maxRows: "", batchIds: [], status: "", jobStats: { completed: 0, total: 0 }, analysis: null, lastRunMode: "batch" };
+    const p = { id: generateId(), name: "New Project", inputCol: "text", skipCol: "", targetCols: "", prompt: "Translate...", contextDoc: "", model: "gpt-5.4-nano", chunkSize: 500, reasoningEffort: "medium", mode: "batch", concurrency: 4, maxRows: "", batchIds: [], status: "", jobStats: { completed: 0, total: 0 }, analysis: null, lastRunMode: "batch" };
     setProjects([...projects, p]);
     setActiveId(p.id);
   };
