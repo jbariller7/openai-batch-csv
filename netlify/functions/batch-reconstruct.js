@@ -97,7 +97,8 @@ exports.handler = async (event) => {
 
       for (const line of outLines) {
         let obj; try { obj = JSON.parse(line); } catch { continue; }
-        const base = Number(obj?.custom_id) || 0;
+        // CRITICAL FIX: Base index parsing
+        const base = parseInt(obj?.custom_id, 10) || 0;
         const text = extractOutputJsonText(obj?.response?.body);
         let parsed = text ? tryParseJsonWithRepairs(text) : null;
 
@@ -144,12 +145,18 @@ exports.handler = async (event) => {
       const row = { ...orig };
       const cols = idToCols.get(idx) || {};
       
-      // Determine if missing: Needs input text AND isn't already handled by the skip column AND OpenAI missed it.
       const targetInputText = String(orig[meta.inputCol] || "").trim();
       const skipText = meta.skipCol ? String(orig[meta.skipCol] || "").trim() : "";
       
-      if (targetInputText && !skipText && (!idToCols.has(idx) || Object.keys(cols).length === 0)) {
-          missingIds.push(idx);
+      if (targetInputText && !skipText) {
+          let isMissing = false;
+          // IF Target columns were defined, check that EVERY specific column was returned by the AI!
+          if (meta.targetCols && meta.targetCols.length > 0) {
+              isMissing = meta.targetCols.some(c => !cols[c] || String(cols[c]).trim() === "");
+          } else {
+              isMissing = (!idToCols.has(idx) || Object.keys(cols).length === 0);
+          }
+          if (isMissing) missingIds.push(idx);
       }
 
       for (const h of dynamicHeaders) row[h] = cols[h] ?? "";
