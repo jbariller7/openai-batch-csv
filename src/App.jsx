@@ -243,20 +243,20 @@ async function checkStatus() {
               </div>
 
 <div className="flex-row form-group">
-                <div>
+<div>
                   <label>Model</label>
                   <select value={model} onChange={(e) => setModel(e.target.value)}>
                     <optgroup label="Current Generation (5.4)">
                       <option value="gpt-5.4-nano">gpt-5.4-nano (Cheapest)</option>
                       <option value="gpt-5.4-mini">gpt-5.4-mini (Balanced)</option>
+                      <option value="gpt-5.4">gpt-5.4 (Flagship)</option>
+                      <option value="gpt-5.4-pro">gpt-5.4-pro (High Reasoning)</option>
                     </optgroup>
-                    <optgroup label="Legacy Budget">
+                    <optgroup label="Previous Generation (5.0 / 5.2)">
                       <option value="gpt-5-nano">gpt-5-nano</option>
-                      <option value="gpt-4.1-mini">gpt-4.1-mini</option>
-                    </optgroup>
-                    <optgroup label="Legacy Flagship">
                       <option value="gpt-5-mini">gpt-5-mini</option>
                       <option value="gpt-5">gpt-5</option>
+                      <option value="gpt-5.2">gpt-5.2</option>
                     </optgroup>
                   </select>
                 </div>
