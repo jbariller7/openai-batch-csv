@@ -5,10 +5,7 @@ exports.config = { /* path: "/api/batch-download" */ };
 
 const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET,OPTIONS,HEAD", "Access-Control-Allow-Headers": "Content-Type" };
 
-function res(statusCode, body, headers) {
-  return { statusCode, headers: { ...(headers || {}), ...CORS }, body: typeof body === "string" ? body : JSON.stringify(body ?? {}) };
-}
-
+function res(statusCode, body, headers) { return { statusCode, headers: { ...(headers || {}), ...CORS }, body: typeof body === "string" ? body : JSON.stringify(body ?? {}) }; }
 function ensureUtf8Bom(str) { return str && !str.startsWith("\uFEFF") ? "\uFEFF" + str : str; }
 
 exports.handler = async (event) => {
@@ -24,6 +21,7 @@ exports.handler = async (event) => {
   const { getStore } = await import("@netlify/blobs");
   const { default: OpenAI } = await import("openai");
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
   const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
   const token  = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
   const store  = (siteID && token) ? getStore({ name: "openai-batch-csv", siteID, token }) : getStore("openai-batch-csv");
@@ -70,7 +68,11 @@ exports.handler = async (event) => {
           }
         }
 
-        const headers = [...Object.keys(rows[0] || {}), ...Array.from(colSet)];
+        // CRITICAL FIX: Prevent duplicate headers
+        const originalHeaders = Object.keys(rows[0] || {});
+        const dynamicHeaders = Array.from(colSet).filter(h => !originalHeaders.includes(h));
+        const headers = [...originalHeaders, ...dynamicHeaders];
+
         const csvStr = await new Promise((resolve, reject) => { csvStringify(merged, { header: true, columns: headers }, (err, out) => err ? reject(err) : resolve(out)); });
         return res(200, ensureUtf8Bom(csvStr), { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename="${id}.partial.csv"`, "X-Partial": "1" });
       }
@@ -115,11 +117,8 @@ exports.handler = async (event) => {
     for (const line of jsonlLines) {
       if (!line.trim()) continue;
       let obj; try { obj = JSON.parse(line); } catch { continue; }
-
-      // CRITICAL FIX: Safe integer parsing for complex custom_ids (e.g. "0_French")
       const base = parseInt(obj?.custom_id, 10) || 0;
       const body = obj?.response?.body || {};
-
       const text = typeof body?.output_text === "string" ? body.output_text : (typeof body?.content === "string" ? body.content : "");
 
       let parsed = null;
@@ -132,7 +131,11 @@ exports.handler = async (event) => {
       else if (typeof text === "string" && text) assignByArray([{ id: base, result: text }], base);
     }
 
-    const headers = [...Object.keys(rows[0] || {}), ...Array.from(colSet)];
+    // CRITICAL FIX: Prevent duplicate headers
+    const originalHeaders = Object.keys(rows[0] || {});
+    const dynamicHeaders = Array.from(colSet).filter(h => !originalHeaders.includes(h));
+    const headers = [...originalHeaders, ...dynamicHeaders];
+
     const csvStr = await new Promise((resolve, reject) => { csvStringify(merged, { header: true, columns: headers }, (err, out) => err ? reject(err) : resolve(out)); });
 
     return res(200, ensureUtf8Bom(csvStr), { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename="${id}.csv"` });
