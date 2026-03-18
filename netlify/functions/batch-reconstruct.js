@@ -84,7 +84,7 @@ exports.handler = async (event) => {
     // Loop through ALL provided batch IDs and merge their outputs
     for (const bId of batchIds) {
       const b = await client.batches.retrieve(bId).catch(() => null);
-      if (!b || !b.output_file_id) continue; // Skip incomplete or invalid batches
+      if (!b || !b.output_file_id) continue; 
       
       const outResp = await client.files.content(b.output_file_id);
       const outLines = Buffer.from(await outResp.arrayBuffer()).toString("utf8").split(/\r?\n/).filter(Boolean);
@@ -125,7 +125,6 @@ exports.handler = async (event) => {
       }
     }
 
-    // Post-pass unwrap
     for (const [id, cols] of idToCols.entries()) {
       if (cols?.result && typeof cols.result === "string") {
         const maybe = parseResultPossiblyJson(cols.result);
@@ -133,7 +132,6 @@ exports.handler = async (event) => {
       }
     }
 
-    // Merge logic
     const resultColSet = new Set();
     for (const cols of idToCols.values()) for (const k of Object.keys(cols)) resultColSet.add(k);
     
@@ -146,9 +144,11 @@ exports.handler = async (event) => {
       const row = { ...orig };
       const cols = idToCols.get(idx) || {};
       
-      // Determine if missing (Only if it was supposed to have data in the input column!)
+      // Determine if missing: Needs input text AND isn't already handled by the skip column AND OpenAI missed it.
       const targetInputText = String(orig[meta.inputCol] || "").trim();
-      if (targetInputText && (!idToCols.has(idx) || Object.keys(cols).length === 0)) {
+      const skipText = meta.skipCol ? String(orig[meta.skipCol] || "").trim() : "";
+      
+      if (targetInputText && !skipText && (!idToCols.has(idx) || Object.keys(cols).length === 0)) {
           missingIds.push(idx);
       }
 
@@ -164,7 +164,7 @@ exports.handler = async (event) => {
             totalRows: flattenedRows.length,
             missingCount: missingIds.length,
             missingIds: missingIds,
-            previewData: flattenedRows.slice(0, 10), // Send first 10 for UI preview
+            previewData: flattenedRows.slice(0, 10), 
             primaryBatchId: firstBatchId
         });
     }
