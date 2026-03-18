@@ -124,15 +124,42 @@ export default function App() {
     } catch (err) { setError(err.message); log(`Error: ${err.message}`); } finally { setIsSubmitting(false); }
   }
 
-  async function checkStatus() {
+async function checkStatus() {
     if (!batchId) return;
     try {
       const r = await fetch(`${API_BASE}/batch-status?id=${encodeURIComponent(batchId)}`);
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || "Status failed");
+      
       setStatus(j.status);
-      if (j.status === "completed") setOutputReady(true);
-    } catch (err) { setError(err.message); }
+
+      // --- NEW: Read OpenAI's remote batch errors ---
+      if (j.status === "failed" && j.errors?.data?.length > 0) {
+        const errorMsg = j.errors.data[0].message;
+        log(`❌ OpenAI Batch Failed: ${errorMsg}`);
+        setError(`OpenAI rejected the batch: ${errorMsg}`);
+        stopPolling();
+        return;
+      }
+
+      // --- NEW: Progress Bar for Batch Mode ---
+      if (j.request_counts) {
+        const { completed, failed, total } = j.request_counts;
+        setJobStats({ completed: completed + failed, total: total });
+      }
+
+      if (j.status === "completed") {
+        setOutputReady(true);
+        if (j.request_counts?.failed > 0) {
+          log(`⚠️ Job completed, but OpenAI reported ${j.request_counts.failed} failed rows. Download the CSV to see specific row errors.`);
+        } else {
+          log("✅ Batch completed successfully. You can download the merged CSV.");
+        }
+      }
+    } catch (err) { 
+      setError(err.message); 
+      log(`Network error while checking status: ${err.message}`);
+    }
   }
 
   async function checkDirectStatus(idParam) {
