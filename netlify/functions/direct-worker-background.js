@@ -20,7 +20,7 @@ exports.handler = async function (event) {
   async function writeStatus(status, extra = {}, message) {
     if (!jobId) return; const now = new Date().toISOString(); let prev = null;
     try { prev = await store.get(`jobs/${jobId}.status.json`, { type: "json" }); } catch {}
-    if (prev?.status === "cancelled") return; // Respect cancel state
+    if (prev?.status === "cancelled") return; 
     const payload = {
       jobId, status: status || prev?.status || "running", updatedAt: now,
       totalChunks: Number(extra?.totalChunks ?? prev?.totalChunks ?? 0),
@@ -54,7 +54,8 @@ exports.handler = async function (event) {
     const meta = await store.get(`jobs/${jobId}.json`, { type: "json" }).catch(() => null);
     if (!meta) { await releaseLock(); return res(404, { error: "Job meta not found" }); }
     
-    const { model, prompt, contextDoc = "", inputCol = "text", chunkSize = 500, concurrency: desiredConcurrency = 4 } = meta;
+    // Extract skipCol
+    const { model, prompt, contextDoc = "", inputCol = "text", skipCol = "", chunkSize = 500, concurrency: desiredConcurrency = 4 } = meta;
 
     const csvTxt = await store.get(`csv/${jobId}.csv`, { type: "text" }).catch(() => null);
     if (!csvTxt) { await writeStatus("failed", {}, "csv missing"); await releaseLock(); return res(404, { error: "CSV missing" }); }
@@ -63,11 +64,12 @@ exports.handler = async function (event) {
       const out = []; csvParse(csvTxt, { columns: true, relax_quotes: true, bom: true, skip_empty_lines: true }).on("data", (r) => out.push(r)).on("end", () => resolve(out)).on("error", reject);
     });
 
-    // FILTER EMPTY DATA
+    // FILTER EMPTY & ALREADY COMPLETED DATA
     const items = [];
     rows.forEach((r, idx) => {
       const text = String(r?.[inputCol] ?? "").trim();
-      if (text) items.push({ id: idx, text });
+      const skipText = skipCol ? String(r?.[skipCol] ?? "").trim() : "";
+      if (text && !skipText) items.push({ id: idx, text });
     });
 
     const systemPromptContent = contextDoc ? `[REFERENCE CONTEXT]\n${contextDoc}\n\n[INSTRUCTIONS]\n${prompt}` : prompt;
@@ -84,7 +86,7 @@ exports.handler = async function (event) {
 
     async function worker() {
       for (;;) {
-        if (await checkCancelled()) break; // Abort if cancelled
+        if (await checkCancelled()) break; 
         const idx = pickNext(); if (idx === -1) break;
         try {
             const resp = await client.responses.create({
@@ -102,7 +104,6 @@ exports.handler = async function (event) {
     
     if (await checkCancelled()) { await releaseLock(); return res(200, { aborted: true }); }
 
-    // Merge outputs (Maps back to original rows by the preserved id index)
     const merged = rows.map((r) => ({ ...r })); const colSet = new Set();
     for (let idx = 0; idx < totalChunks; idx++) {
       const part = parts[idx]; if (!part) continue;
