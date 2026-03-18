@@ -42,24 +42,44 @@ exports.handler = async function (event) {
     if (!repairItems.length) return res(400, { error: "Could not extract valid text for the missing rows." });
 
     // 4. Construct JSONL for the repair batch
-    const systemPromptContent = meta.contextDoc ? `[REFERENCE CONTEXT]\n${meta.contextDoc}\n\n[INSTRUCTIONS]\n${meta.prompt}` : meta.prompt;
-    const suffix = ' You will receive a json object {"rows":[{"id":number,"text":string},...]}. For each item, produce {"id": same id, "result": <string>} following the user instructions above. The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]} in the SAME ORDER as input.';
+    function buildBody(rowsChunk, targetModel, targetColName) {
+      let currentPrompt = meta.prompt;
+      let suffix = ' You will receive a json object {"rows":[{"id":number,"text":string},...]}. For each item, produce {"id": same id, "result": <string>} following the user instructions above. The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]} in the SAME ORDER as input.';
+      
+      if (targetColName) {
+        currentPrompt = meta.prompt.replace(/\$\{columnName(s)?\}/gi, targetColName);
+        suffix = ` You will receive a json object {"rows":[{"id":number,"text":string},...]}. For each item, produce {"id": same id, "cols": {"${targetColName}": <string>}} following the user instructions above. The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"cols":{"${targetColName}": "..."}},...]} in the SAME ORDER as input.`;
+      }
+      
+      const systemPromptContent = meta.contextDoc ? `[REFERENCE CONTEXT]\n${meta.contextDoc}\n\n[INSTRUCTIONS]\n${currentPrompt}` : currentPrompt;
+      
+      return {
+        model: targetModel,
+        input: [
+          { role: "system", content: `${systemPromptContent}${suffix}` },
+          { role: "user", content: "Return only a json object as specified. The output must be valid json." },
+          { role: "user", content: JSON.stringify({ rows: rowsChunk }) }
+        ],
+        text: { format: { type: "json_object" } },
+      };
+    }
 
     const chunkSize = meta.chunkSize || 500;
     const lines = [];
     
-    for (let start = 0; start < repairItems.length; start += chunkSize) {
+    // Reproduce multi-column chunking structure!
+    if (meta.targetCols && meta.targetCols.length > 0) {
+      meta.targetCols.forEach((colName, colIdx) => {
+        for (let start = 0; start < repairItems.length; start += chunkSize) {
+          const chunk = repairItems.slice(start, start + chunkSize);
+          lines.push(JSON.stringify({ custom_id: `${chunk[0].id}_${colIdx}`, method: "POST", url: "/v1/responses", body: buildBody(chunk, meta.model, colName) }));
+        }
+      });
+    } else {
+      for (let start = 0; start < repairItems.length; start += chunkSize) {
         const chunk = repairItems.slice(start, start + chunkSize);
-        const body = {
-            model: meta.model,
-            input: [
-              { role: "system", content: `${systemPromptContent}${suffix}` },
-              { role: "user", content: "Return only a json object as specified. The output must be valid json." },
-              { role: "user", content: JSON.stringify({ rows: chunk }) }
-            ],
-            text: { format: { type: "json_object" } },
-        };
-        lines.push(JSON.stringify({ custom_id: String(chunk[0].id), method: "POST", url: "/v1/responses", body }));
+        lines.push(JSON.stringify({ custom_id: String(chunk[0].id), method: "POST", url: "/v1/responses", body: buildBody(chunk, meta.model, null) }));
+      }
     }
 
     const jsonlBuffer = Buffer.from(lines.join("\n"), "utf8");
