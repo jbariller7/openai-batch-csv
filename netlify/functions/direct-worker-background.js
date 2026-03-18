@@ -54,8 +54,7 @@ exports.handler = async function (event) {
     const meta = await store.get(`jobs/${jobId}.json`, { type: "json" }).catch(() => null);
     if (!meta) { await releaseLock(); return res(404, { error: "Job meta not found" }); }
     
-    // Extract skipCol
-    const { model, prompt, contextDoc = "", inputCol = "text", skipCol = "", chunkSize = 500, concurrency: desiredConcurrency = 4 } = meta;
+    const { model, prompt, contextDoc = "", inputCol = "text", skipCol = "", targetCols = [], chunkSize = 500, concurrency: desiredConcurrency = 4 } = meta;
 
     const csvTxt = await store.get(`csv/${jobId}.csv`, { type: "text" }).catch(() => null);
     if (!csvTxt) { await writeStatus("failed", {}, "csv missing"); await releaseLock(); return res(404, { error: "CSV missing" }); }
@@ -64,7 +63,6 @@ exports.handler = async function (event) {
       const out = []; csvParse(csvTxt, { columns: true, relax_quotes: true, bom: true, skip_empty_lines: true }).on("data", (r) => out.push(r)).on("end", () => resolve(out)).on("error", reject);
     });
 
-    // FILTER EMPTY & ALREADY COMPLETED DATA
     const items = [];
     rows.forEach((r, idx) => {
       const text = String(r?.[inputCol] ?? "").trim();
@@ -72,10 +70,14 @@ exports.handler = async function (event) {
       if (text && !skipText) items.push({ id: idx, text });
     });
 
-    const systemPromptContent = contextDoc ? `[REFERENCE CONTEXT]\n${contextDoc}\n\n[INSTRUCTIONS]\n${prompt}` : prompt;
-    const suffix = ' You will receive a json object {"rows":[{"id":number,"text":string},...]}. For each item, produce {"id": same id, "cols": { /* one or more named columns */ }} following the user instructions above. The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"cols":{...}},...]} in the SAME ORDER as input.';
-
-    const chunks = []; for (let i = 0; i < items.length; i += chunkSize) chunks.push(items.slice(i, i + chunkSize));
+    const chunks = []; 
+    if (targetCols && targetCols.length > 0) {
+      targetCols.forEach(colName => {
+        for (let i = 0; i < items.length; i += chunkSize) chunks.push({ rows: items.slice(i, i + chunkSize), targetCol: colName });
+      });
+    } else {
+      for (let i = 0; i < items.length; i += chunkSize) chunks.push({ rows: items.slice(i, i + chunkSize), targetCol: null });
+    }
     const totalChunks = chunks.length;
     
     const concurrency = Math.max(1, Math.min(MAX_DIRECT_CONCURRENCY, Number(desiredConcurrency || 4)));
@@ -89,8 +91,19 @@ exports.handler = async function (event) {
         if (await checkCancelled()) break; 
         const idx = pickNext(); if (idx === -1) break;
         try {
+            const chunkObj = chunks[idx];
+            let currentPrompt = prompt;
+            let suffix = ' You will receive a json object {"rows":[{"id":number,"text":string},...]}. For each item, produce {"id": same id, "result": <string>} following the user instructions above. The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]} in the SAME ORDER as input.';
+            
+            if (chunkObj.targetCol) {
+              currentPrompt = prompt.replace(/\$\{columnName(s)?\}/gi, chunkObj.targetCol);
+              suffix = ` You will receive a json object {"rows":[{"id":number,"text":string},...]}. For each item, produce {"id": same id, "cols": {"${chunkObj.targetCol}": <string>}} following the user instructions above. The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"cols":{"${chunkObj.targetCol}": "..."}},...]} in the SAME ORDER as input.`;
+            }
+            
+            const systemPromptContent = contextDoc ? `[REFERENCE CONTEXT]\n${contextDoc}\n\n[INSTRUCTIONS]\n${currentPrompt}` : currentPrompt;
+
             const resp = await client.responses.create({
-              model, input: [{ role: "system", content: `${systemPromptContent}${suffix}` }, { role: "user", content: "Return only a json object as specified. The output must be valid json." }, { role: "user", content: JSON.stringify({ rows: chunks[idx] }) }], text: { format: { type: "json_object" } }
+              model, input: [{ role: "system", content: `${systemPromptContent}${suffix}` }, { role: "user", content: "Return only a json object as specified. The output must be valid json." }, { role: "user", content: JSON.stringify({ rows: chunkObj.rows }) }], text: { format: { type: "json_object" } }
             });
             let parsed = null; try { parsed = JSON.parse(resp.output_text || ""); } catch {}
             parts[idx] = parsed; completedChunks++;
