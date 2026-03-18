@@ -33,9 +33,10 @@ exports.handler = async function (event) {
     if (!fileBuffer) return res(400, { error: "CSV file is required" });
 
     const inputCol = fields.inputCol || "text";
-    const model = fields.model || "gpt-5-nano";
+    const skipCol = fields.skipCol || ""; // Capture skip col
+    const model = fields.model || "gpt-5.4-nano";
     const prompt = fields.prompt || "Translate to English.";
-    const contextDoc = fields.contextDoc || ""; // Prompt Caching Context
+    const contextDoc = fields.contextDoc || "";
     const chunkSize = Math.max(1, Math.min(1000, Number(fields.chunkSize || 500)));
 
     const query = getQuery(event);
@@ -59,14 +60,18 @@ exports.handler = async function (event) {
 
     const effectiveRows = maxRows > 0 ? rows.slice(0, maxRows) : rows;
     
-    // PRE-FILTER EMPTY DATA: Only package rows that actually contain text
+    // PRE-FILTER EMPTY DATA & ALREADY COMPLETED DATA
     const validItems = [];
     effectiveRows.forEach((r, idx) => {
       const text = String(r?.[inputCol] ?? "").trim();
-      if (text) validItems.push({ id: idx, text }); // id remains original row index for reconstruction!
+      const skipText = skipCol ? String(r?.[skipCol] ?? "").trim() : "";
+      
+      // Only package it if there is input text AND the target skip column is empty
+      if (text && !skipText) validItems.push({ id: idx, text }); 
     });
 
-    // Construct Cacheable System Prompt
+    if (validItems.length === 0) return res(400, { error: "No valid rows found (all empty or already skipped)." });
+
     const systemPromptContent = contextDoc ? `[REFERENCE CONTEXT]\n${contextDoc}\n\n[INSTRUCTIONS]\n${prompt}` : prompt;
     const suffix = ' You will receive a json object {"rows":[{"id":number,"text":string},...]}. For each item, produce {"id": same id, "result": <string>} following the user instructions above. The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]} in the SAME ORDER as input.';
 
@@ -91,7 +96,7 @@ exports.handler = async function (event) {
     }
 
     if (direct) {
-      await store.set(`jobs/${jobId}.json`, JSON.stringify({ jobId, model, prompt, contextDoc, inputCol, chunkSize, concurrency, createdAt: new Date().toISOString() }), { contentType: "application/json" });
+      await store.set(`jobs/${jobId}.json`, JSON.stringify({ jobId, model, prompt, contextDoc, inputCol, skipCol, chunkSize, concurrency, createdAt: new Date().toISOString() }), { contentType: "application/json" });
       await store.set(`jobs/${jobId}.status.json`, JSON.stringify({ jobId, status: "queued", updatedAt: new Date().toISOString(), events: [{ ts: new Date().toISOString(), msg: "queued" }] }), { contentType: "application/json" });
       
       const hdrs = event.headers || {};
@@ -115,7 +120,7 @@ exports.handler = async function (event) {
     const jsonlFile = await client.files.create({ file: await toFile(jsonlBuffer, `${jobId}.jsonl`, { type: "application/jsonl" }), purpose: "batch" });
     const batch = await client.batches.create({ input_file_id: jsonlFile.id, endpoint: "/v1/responses", completion_window: "24h" });
 
-    await store.set(`jobs/${batch.id}.json`, JSON.stringify({ jobId, batchId: batch.id, inputCol, model, prompt, chunkSize, createdAt: new Date().toISOString() }), { contentType: "application/json" });
+    await store.set(`jobs/${batch.id}.json`, JSON.stringify({ jobId, batchId: batch.id, inputCol, skipCol, model, prompt, chunkSize, createdAt: new Date().toISOString() }), { contentType: "application/json" });
     return res(200, { mode: "batch", batchId: batch.id, jobId });
   } catch (err) { return res(500, { error: err?.message || String(err) }); }
 };
