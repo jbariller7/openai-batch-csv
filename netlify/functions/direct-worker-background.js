@@ -130,7 +130,11 @@ exports.handler = async function (event) {
       }
     }
 
-    const headers = [...Object.keys(rows[0] || {}), ...Array.from(colSet)];
+    // CRITICAL FIX: Prevent duplicate headers
+    const originalHeaders = Object.keys(rows[0] || {});
+    const dynamicHeaders = Array.from(colSet).filter(h => !originalHeaders.includes(h));
+    const headers = [...originalHeaders, ...dynamicHeaders];
+
     const csvStr = await new Promise((res, rej) => { csvStringify(merged, { header: true, columns: headers }, (err, out) => err ? rej(err) : res(out)); });
     await store.set(`results/${jobId}.csv`, ensureUtf8Bom(csvStr), { contentType: "text/csv; charset=utf-8" });
     await writeStatus("ready", { completedChunks: totalChunks }, "csv written: ready");
