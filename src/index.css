@@ -34,7 +34,7 @@ h1 { text-align: center; margin-top: 1rem; margin-bottom: 1.5rem; font-weight: 7
   color: #64748b;
   border: 1px solid transparent;
   border-bottom: none;
-  margin-bottom: -2px; /* Pull down to overlap the border */
+  margin-bottom: -2px; 
   z-index: 1;
   position: relative;
   white-space: nowrap;
@@ -56,6 +56,21 @@ h1 { text-align: center; margin-top: 1rem; margin-bottom: 1.5rem; font-weight: 7
   background: none; border: 1px dashed #cbd5e1; color: #64748b; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-weight: 600; margin-bottom: 6px; font-size: 13px;
 }
 .new-project-btn:hover { border-color: #0066ff; color: #0066ff; background: #eff6ff; }
+
+/* Editable Project Name */
+.project-name-input {
+  font-size: 24px;
+  font-weight: 700;
+  border: none;
+  background: transparent;
+  margin-bottom: 24px;
+  width: 100%;
+  color: #111;
+  border-bottom: 2px dashed transparent;
+  padding: 0 0 4px 0;
+  transition: border-color 0.2s;
+}
+.project-name-input:focus { outline: none; border-bottom: 2px dashed #0066ff; }
 
 /* 2-Column Grid */
 .app-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start; }
