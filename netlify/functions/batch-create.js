@@ -33,7 +33,10 @@ exports.handler = async function (event) {
     if (!fileBuffer) return res(400, { error: "CSV file is required" });
 
     const inputCol = fields.inputCol || "text";
-    const skipCol = fields.skipCol || ""; // Capture skip col
+    const skipCol = fields.skipCol || ""; 
+    const targetColsRaw = fields.targetCols || "";
+    const targetCols = targetColsRaw.split(",").map(s => s.trim()).filter(Boolean);
+
     const model = fields.model || "gpt-5.4-nano";
     const prompt = fields.prompt || "Translate to English.";
     const contextDoc = fields.contextDoc || "";
@@ -60,22 +63,26 @@ exports.handler = async function (event) {
 
     const effectiveRows = maxRows > 0 ? rows.slice(0, maxRows) : rows;
     
-    // PRE-FILTER EMPTY DATA & ALREADY COMPLETED DATA
     const validItems = [];
     effectiveRows.forEach((r, idx) => {
       const text = String(r?.[inputCol] ?? "").trim();
       const skipText = skipCol ? String(r?.[skipCol] ?? "").trim() : "";
-      
-      // Only package it if there is input text AND the target skip column is empty
       if (text && !skipText) validItems.push({ id: idx, text }); 
     });
 
     if (validItems.length === 0) return res(400, { error: "No valid rows found (all empty or already skipped)." });
 
-    const systemPromptContent = contextDoc ? `[REFERENCE CONTEXT]\n${contextDoc}\n\n[INSTRUCTIONS]\n${prompt}` : prompt;
-    const suffix = ' You will receive a json object {"rows":[{"id":number,"text":string},...]}. For each item, produce {"id": same id, "result": <string>} following the user instructions above. The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]} in the SAME ORDER as input.';
-
-    function buildBody(rowsChunk, targetModel) {
+    function buildBody(rowsChunk, targetModel, targetColName) {
+      let currentPrompt = prompt;
+      let suffix = ' You will receive a json object {"rows":[{"id":number,"text":string},...]}. For each item, produce {"id": same id, "result": <string>} following the user instructions above. The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"result":string},...]} in the SAME ORDER as input.';
+      
+      if (targetColName) {
+        currentPrompt = prompt.replace(/\$\{columnName(s)?\}/gi, targetColName);
+        suffix = ` You will receive a json object {"rows":[{"id":number,"text":string},...]}. For each item, produce {"id": same id, "cols": {"${targetColName}": <string>}} following the user instructions above. The output must be valid json. Return ONLY a json object exactly like: {"results":[{"id":number,"cols":{"${targetColName}": "..."}},...]} in the SAME ORDER as input.`;
+      }
+      
+      const systemPromptContent = contextDoc ? `[REFERENCE CONTEXT]\n${contextDoc}\n\n[INSTRUCTIONS]\n${currentPrompt}` : currentPrompt;
+      
       return {
         model: targetModel,
         input: [
@@ -90,13 +97,14 @@ exports.handler = async function (event) {
     if (dryRun) {
       const dryK = Math.min(chunkSize, 5);
       const firstChunk = validItems.slice(0, dryK);
-      const resp = await client.responses.create(buildBody(firstChunk, model.startsWith("gpt-5") ? "gpt-4.1-mini" : model));
+      const firstCol = targetCols.length > 0 ? targetCols[0] : null;
+      const resp = await client.responses.create(buildBody(firstChunk, model.startsWith("gpt-5") ? "gpt-4.1-mini" : model, firstCol));
       let parsed = null; try { parsed = JSON.parse(resp.output_text || ""); } catch {}
       return res(200, { mode: "dryRun", jobId, usedRows: firstChunk.length, model, response: resp, parsed });
     }
 
     if (direct) {
-      await store.set(`jobs/${jobId}.json`, JSON.stringify({ jobId, model, prompt, contextDoc, inputCol, skipCol, chunkSize, concurrency, createdAt: new Date().toISOString() }), { contentType: "application/json" });
+      await store.set(`jobs/${jobId}.json`, JSON.stringify({ jobId, model, prompt, contextDoc, inputCol, skipCol, targetCols, chunkSize, concurrency, createdAt: new Date().toISOString() }), { contentType: "application/json" });
       await store.set(`jobs/${jobId}.status.json`, JSON.stringify({ jobId, status: "queued", updatedAt: new Date().toISOString(), events: [{ ts: new Date().toISOString(), msg: "queued" }] }), { contentType: "application/json" });
       
       const hdrs = event.headers || {};
@@ -110,17 +118,27 @@ exports.handler = async function (event) {
       return res(202, { mode: "direct", jobId, model, rowCount: validItems.length, download: `/.netlify/functions/batch-download?id=${jobId}` });
     }
 
-    // BATCH MODE
+    // BATCH MODE (Multi-Column Splitting)
     const lines = [];
-    for (let start = 0; start < validItems.length; start += chunkSize) {
-      lines.push(JSON.stringify({ custom_id: String(start), method: "POST", url: "/v1/responses", body: buildBody(validItems.slice(start, start + chunkSize), model) }));
+    if (targetCols.length > 0) {
+      targetCols.forEach((colName, colIdx) => {
+        for (let start = 0; start < validItems.length; start += chunkSize) {
+          const chunk = validItems.slice(start, start + chunkSize);
+          lines.push(JSON.stringify({ custom_id: `${start}_${colIdx}`, method: "POST", url: "/v1/responses", body: buildBody(chunk, model, colName) }));
+        }
+      });
+    } else {
+      for (let start = 0; start < validItems.length; start += chunkSize) {
+        const chunk = validItems.slice(start, start + chunkSize);
+        lines.push(JSON.stringify({ custom_id: String(start), method: "POST", url: "/v1/responses", body: buildBody(chunk, model, null) }));
+      }
     }
 
     const jsonlBuffer = Buffer.from(lines.join("\n"), "utf8");
     const jsonlFile = await client.files.create({ file: await toFile(jsonlBuffer, `${jobId}.jsonl`, { type: "application/jsonl" }), purpose: "batch" });
     const batch = await client.batches.create({ input_file_id: jsonlFile.id, endpoint: "/v1/responses", completion_window: "24h" });
 
-    await store.set(`jobs/${batch.id}.json`, JSON.stringify({ jobId, batchId: batch.id, inputCol, skipCol, model, prompt, chunkSize, createdAt: new Date().toISOString() }), { contentType: "application/json" });
+    await store.set(`jobs/${batch.id}.json`, JSON.stringify({ jobId, batchId: batch.id, inputCol, skipCol, targetCols, model, prompt, chunkSize, createdAt: new Date().toISOString() }), { contentType: "application/json" });
     return res(200, { mode: "batch", batchId: batch.id, jobId });
   } catch (err) { return res(500, { error: err?.message || String(err) }); }
 };
