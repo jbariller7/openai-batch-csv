@@ -28,7 +28,7 @@ export default function App() {
   const [inputCol, setInputCol] = useState("text");
   const [prompt, setPrompt] = useState("Translate the user input into English.");
   const [contextDoc, setContextDoc] = useState("");
-  const [model, setModel] = useState("gpt-5-nano");
+  const [model, setModel] = useState("gpt-5.4-nano");
   const [chunkSize, setChunkSize] = useState(500);
   const [reasoningEffort, setReasoningEffort] = useState("medium");
   const [mode, setMode] = useState("batch");
@@ -215,15 +215,19 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="flex-row form-group">
+<div className="flex-row form-group">
                 <div>
                   <label>Model</label>
                   <select value={model} onChange={(e) => setModel(e.target.value)}>
-                    <optgroup label="Budget (Best for bulk)">
+                    <optgroup label="Current Generation (5.4)">
+                      <option value="gpt-5.4-nano">gpt-5.4-nano (Cheapest)</option>
+                      <option value="gpt-5.4-mini">gpt-5.4-mini (Balanced)</option>
+                    </optgroup>
+                    <optgroup label="Legacy Budget">
                       <option value="gpt-5-nano">gpt-5-nano</option>
                       <option value="gpt-4.1-mini">gpt-4.1-mini</option>
                     </optgroup>
-                    <optgroup label="Flagship">
+                    <optgroup label="Legacy Flagship">
                       <option value="gpt-5-mini">gpt-5-mini</option>
                       <option value="gpt-5">gpt-5</option>
                     </optgroup>
