@@ -25,6 +25,7 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
   const [file, setFile] = useState(null);
   const [isDragging, setIsDragging] = useState(false);
   const [importId, setImportId] = useState("");
+  const [batchIdInput, setBatchIdInput] = useState(batchIds.join(", "));
   
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -41,6 +42,9 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
 
   function log(msg) { setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]); }
   useEffect(() => { if (logRef.current && consoleOpen) logRef.current.scrollTop = logRef.current.scrollHeight; }, [logs, consoleOpen]);
+
+  // Keep internal text input synced with global batch array
+  useEffect(() => { setBatchIdInput(batchIds.join(", ")); }, [batchIds]);
 
   const pollRef = useRef(null);
   function stopPolling() { if (pollRef.current) clearInterval(pollRef.current); pollRef.current = null; }
@@ -168,6 +172,7 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || "Repair failed.");
       
+      // Update batch IDs array, and clear old analysis so user knows to re-run it
       update({ batchIds: [...batchIds, j.newBatchId], status: "submitted", analysis: null, lastRunMode: "batch" });
       log(`✅ Repair batch submitted! ID: ${j.newBatchId}`);
     } catch(e) { setError(e.message); log(`❌ Repair Error: ${e.message}`); } finally { setIsRepairing(false); }
@@ -179,6 +184,15 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
 
   return (
     <div style={{ display: isActive ? 'block' : 'none' }}>
+      
+      {/* Editable Project Name Header */}
+      <input 
+        className="project-name-input" 
+        value={name} 
+        onChange={(e) => update({ name: e.target.value })} 
+        placeholder="Project Name..."
+      />
+
       <div className="app-grid">
         {/* LEFT COLUMN: CONFIGURATION */}
         <div>
@@ -187,7 +201,7 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
               <summary>View / Edit Job Configuration</summary>
               <div style={{padding: "0 24px 24px 24px"}}>
                 <p style={{fontSize: 13, color: "#666"}}><em>Note: Changing these settings does not affect the currently running batch.</em></p>
-                <ConfigForm file={file} setFile={setFile} isDragging={isDragging} setIsDragging={setIsDragging} update={update} {...project} isCachedHit={isCachedHit} estTokens={estTokens} barWidth={barWidth} submitBatch={submitBatch} isSubmitting={isSubmitting} />
+                <ConfigForm file={file} setFile={setFile} isDragging={isDragging} setIsDragging={setIsDragging} update={update} inputCol={inputCol} skipCol={skipCol} prompt={prompt} contextDoc={contextDoc} model={model} chunkSize={chunkSize} mode={mode} maxRows={maxRows} concurrency={concurrency} isCachedHit={isCachedHit} estTokens={estTokens} barWidth={barWidth} submitBatch={submitBatch} isSubmitting={isSubmitting} />
               </div>
             </details>
           ) : (
@@ -197,17 +211,18 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
                 <input value={importId} onChange={e=>setImportId(e.target.value)} placeholder="Or import existing Batch ID..." />
                 <button type="submit" className="secondary">Track</button>
               </form>
-              <ConfigForm file={file} setFile={setFile} isDragging={isDragging} setIsDragging={setIsDragging} update={update} {...project} isCachedHit={isCachedHit} estTokens={estTokens} barWidth={barWidth} submitBatch={submitBatch} isSubmitting={isSubmitting} />
+              <ConfigForm file={file} setFile={setFile} isDragging={isDragging} setIsDragging={setIsDragging} update={update} inputCol={inputCol} skipCol={skipCol} prompt={prompt} contextDoc={contextDoc} model={model} chunkSize={chunkSize} mode={mode} maxRows={maxRows} concurrency={concurrency} isCachedHit={isCachedHit} estTokens={estTokens} barWidth={barWidth} submitBatch={submitBatch} isSubmitting={isSubmitting} />
             </div>
           )}
 
           {/* ANALYSIS & REPAIR CARD */}
-          {isJobActive && (status === "completed" || status === "ready" || analysis) && (
+          {/* Always show this card if there are batches linked to this project! */}
+          {isJobActive && (
             <div className="card" style={{ marginTop: "24px" }}>
               <h2>Data Analysis & Repair</h2>
-              <p style={{ fontSize: 13, color: "#555" }}>Check for dropped rows and automatically resubmit failures.</p>
+              <p style={{ fontSize: 13, color: "#555" }}>Check for dropped rows across all tracked batches.</p>
               
-              <button onClick={handleAnalyze} disabled={isAnalyzing || status !== "completed"} style={{ width: "100%", marginBottom: 16 }}>
+              <button onClick={handleAnalyze} disabled={isAnalyzing || status === "running" || status === "submitted"} style={{ width: "100%", marginBottom: 16 }}>
                 {isAnalyzing ? "Analyzing Data..." : "Analyze Extracted Data"}
               </button>
 
@@ -249,8 +264,19 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
               <h2>Job Status</h2>
               {isJobActive && (
                 <div style={{ marginBottom: 16 }}>
-                  <p style={{ margin: "0 0 8px 0" }}><strong>Batch ID:</strong> <span style={{ fontFamily: "monospace", fontSize: 13 }}>{currentBatchId}</span></p>
-                  <p style={{ margin: "0 0 8px 0" }}><strong>Status:</strong> <span style={{ textTransform: "capitalize", color: status === "failed" ? "red" : status === "ready" || status === "completed" ? "green" : "#0066ff", fontWeight: 600 }}>{status || "running"}</span></p>
+                  
+                  {/* Editable Batch IDs field */}
+                  <div className="form-group" style={{background: "#f8fafc", padding: "12px", borderRadius: "8px", border: "1px solid #e2e8f0"}}>
+                    <label style={{fontSize: 12, color: "#475569"}}>Tracked Batch IDs (Output will be merged)</label>
+                    <input 
+                      value={batchIdInput}
+                      onChange={(e) => setBatchIdInput(e.target.value)}
+                      onBlur={() => update({ batchIds: batchIdInput.split(",").map(s=>s.trim()).filter(Boolean) })}
+                      style={{fontFamily: "monospace", fontSize: 12, padding: "8px", marginTop: "4px"}}
+                    />
+                  </div>
+
+                  <p style={{ margin: "0 0 8px 0" }}><strong>Status ({currentBatchId?.slice(6,14)}...):</strong> <span style={{ textTransform: "capitalize", color: status === "failed" ? "red" : status === "ready" || status === "completed" ? "green" : "#0066ff", fontWeight: 600 }}>{status || "running"}</span></p>
                   
                   {(status === "running" || status === "submitted") && (
                     <div style={{ marginTop: 16, marginBottom: 16 }}>
@@ -282,11 +308,14 @@ function ProjectWorkspace({ project, updateProject, isActive }) {
   );
 }
 
+// Separate component isolates the file input Ref!
 function ConfigForm({ file, setFile, isDragging, setIsDragging, update, inputCol, skipCol, prompt, contextDoc, model, chunkSize, mode, maxRows, concurrency, isCachedHit, estTokens, barWidth, submitBatch, isSubmitting }) {
+  const fileInputRef = useRef(null);
+
   return (
     <form onSubmit={submitBatch}>
-      <div className={`dropzone ${isDragging ? "active" : ""}`} onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={(e) => { e.preventDefault(); setIsDragging(false); setFile(e.dataTransfer.files[0]); }} onClick={() => document.getElementById("fileInput").click()}>
-        <input id="fileInput" type="file" accept=".csv" style={{ display: "none" }} onChange={(e) => setFile(e.target.files[0])} />
+      <div className={`dropzone ${isDragging ? "active" : ""}`} onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={(e) => { e.preventDefault(); setIsDragging(false); setFile(e.dataTransfer.files[0]); }} onClick={() => fileInputRef.current.click()}>
+        <input ref={fileInputRef} type="file" accept=".csv" style={{ display: "none" }} onChange={(e) => setFile(e.target.files[0])} />
         {file ? <p className="file-name">{file.name} ({(file.size/1024).toFixed(1)} KB)</p> : <p>Drag & Drop a CSV file here</p>}
       </div>
 
@@ -353,7 +382,6 @@ export default function App() {
 
   return (
     <div className="container">
-      <h1>OpenAI Batch CSV</h1>
       
       <div className="tabs-container">
         {projects.map(p => (
